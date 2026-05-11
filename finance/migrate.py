@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Apply or roll back the finance receipt-tables migration.
+"""Apply or roll back finance migrations.
 
 Usage:
-    SUPABASE_DB_URL=... python3 finance/migrate.py up
-    SUPABASE_DB_URL=... python3 finance/migrate.py down
+    SUPABASE_DB_URL=... python3 finance/migrate.py up           # apply every up migration in order
+    SUPABASE_DB_URL=... python3 finance/migrate.py down         # roll back every down migration in reverse order
+    SUPABASE_DB_URL=... python3 finance/migrate.py up 001       # apply just 001_*.up.sql
+    SUPABASE_DB_URL=... python3 finance/migrate.py down 002     # roll back just 002_*.down.sql
 
-The script reads SQL from finance/migrations/001_receipt_tables.{up,down}.sql
-and applies it inside a single transaction. Both files are idempotent on a
-fresh clone (CREATE IF NOT EXISTS / DROP IF EXISTS).
+Every SQL file is idempotent on re-apply (CREATE/DROP IF EXISTS) and wrapped in
+its own BEGIN/COMMIT, so partial states never linger.
 """
 from __future__ import annotations
 
@@ -18,28 +19,49 @@ from pathlib import Path
 import psycopg2
 
 MIGRATIONS_DIR = Path(__file__).parent / "migrations"
-UP_FILE = MIGRATIONS_DIR / "001_receipt_tables.up.sql"
-DOWN_FILE = MIGRATIONS_DIR / "001_receipt_tables.down.sql"
+
+
+def _discover(direction: str) -> list[Path]:
+    suffix = ".up.sql" if direction == "up" else ".down.sql"
+    files = sorted(MIGRATIONS_DIR.glob(f"*{suffix}"))
+    if direction == "down":
+        files = list(reversed(files))
+    return files
+
+
+def _filter(files: list[Path], prefix: str | None) -> list[Path]:
+    if prefix is None:
+        return files
+    matched = [f for f in files if f.name.startswith(prefix + "_") or f.stem.startswith(prefix)]
+    if not matched:
+        raise SystemExit(f"no migration matched prefix {prefix!r}")
+    return matched
 
 
 def main() -> int:
-    if len(sys.argv) != 2 or sys.argv[1] not in ("up", "down"):
-        print("usage: migrate.py {up|down}", file=sys.stderr)
+    if len(sys.argv) < 2 or sys.argv[1] not in ("up", "down"):
+        print("usage: migrate.py {up|down} [prefix]", file=sys.stderr)
         return 2
 
     direction = sys.argv[1]
-    sql_file = UP_FILE if direction == "up" else DOWN_FILE
-    sql = sql_file.read_text()
+    prefix = sys.argv[2] if len(sys.argv) > 2 else None
 
     url = os.environ.get("SUPABASE_DB_URL")
     if not url:
         print("SUPABASE_DB_URL not set", file=sys.stderr)
         return 2
 
+    files = _filter(_discover(direction), prefix)
+    if not files:
+        print("no migrations found")
+        return 0
+
     with psycopg2.connect(url) as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql)
-    print(f"Migration {direction!r} applied from {sql_file.name}")
+        for sql_file in files:
+            sql = sql_file.read_text()
+            with conn.cursor() as cur:
+                cur.execute(sql)
+            print(f"Migration {direction!r} applied from {sql_file.name}")
     return 0
 
 
