@@ -1,0 +1,53 @@
+Credit note
+20th January 2026 - €9.50
+Lucky Penny Software LLC
+via Paddle.com
+Credit note to
+Sebastian Stuecker
+sebastian.stuecker@gmail.com
+Lineo Finance GmbH
+Neptunstr. 20a
+Moosburg 85368
+Germany
+Credit note from
+Paddle.com Market Ltd
+Judd House 18-29 Mora Street
+London EC1V 8BT
+United Kingdom
+VAT Number: DE421935467
+VAT Number: EU372017215
+Company Number: 08172165
+Credit note details
+Credit note reference: CN-6945-10021
+Refunded invoice reference: 6945-10683
+Transaction ID: txn_01kfdaj48ah1g4acfefe181rgx
+Reason: Tax refund
+Currency code: EUR
+Transaction
+Product
+Qty
+Unit price
+Tax rate
+Amount
+Standard - MediatR
+20th January 2026 - 20th February 2026
+1
+€0.00
+19%
+€9.50
+Subtotal
+€0.00
+Tax
+€9.50
+Total refunded
+€9.50
+Tax breakdown
+Tax %
+Tax
+19%
+€9.50
+Total
+€9.50
+If you have a problem with your order (e.g. don’t recognize the charge, suspect a fraudulent transaction, etc,) please visit paddle.net.
+Paddle.com Market Ltd, Judd House, 18-29 Mora Street, London EC1V 8BT.
+© 2026 Paddle. All rights reserved.
