@@ -1,0 +1,77 @@
+Page 1 of 2
+Invoice
+Invoice number ZWLWGPDN-0002
+Date of issue
+April 4, 2026
+Date due
+April 4, 2026
+Notion Labs, Inc.
+685 Market Street
+San Francisco, California 94105
+United States
+team@makenotion.com
+Bill to
+Sebastian Stücker
+Neptunstr. 20a
+85368 Moosburg
+Germany
+sebastian.stuecker@lineo.finance
+DE VAT DE421935467
+Ship to
+Sebastian Stücker
+Neptunstr. 20a
+85368 Moosburg
+Germany
+€444.91 due April 4, 2026
+Pay online
+Description
+Qty
+Unit price
+Amount
+Remaining time on 2 × Business after 11 Mar 2026
+Mar 11, 2026–Mar 4, 2027
+2
+€459.02
+Unused time on Business after 11 Mar 2026
+Mar 11, 2026–Mar 4, 2027
+1
+-
+€229.51
+Tax
+Mar 11, 2026–Mar 4, 2027
+1
+€0.00
+€0.00
+Remaining time on 3 × Business after 02 Apr 2026
+Apr 2, 2026–Mar 4, 2027
+3
+€646.22
+Unused time on 2 × Business after 02 Apr 2026
+Apr 2, 2026–Mar 4, 2027
+2
+-
+€430.82
+Subtotal
+€444.91
+Total
+€444.91
+Amount due
+€444.91
+
+ 
+Page 2 of 2
+Tax will vary based on your jurisdiction. If your Company is located in the United States, tax relates to state and local sales tax. If 
+your Company is located in Canada, tax represents Quebec sales tax (QST). If your Company is located in the European Union or 
+United Kingdom, tax represents value-added tax (VAT). If your Company is located in the European Union or the United Kingdom 
+and are not charged VAT, this invoice relates to services which are deemed to be supplied where received and under Article 196 
+Council Directive 2006/112/EC the customer must self-account for VAT on the reverse charge basis in their own jurisdiction. 
+Notion is required to charge Japanese Consumption Tax (JCT) at a rate of 10% on services provided to consumers and 
+businesses in Japan. If you're using Notion for business purposes and do not have JCT charged on your invoice, you are 
+responsible for self-assessing and reporting JCT under the reverse charge mechanism.
+EU VAT: EU528003828
+CA QST: NR00012289
+JPN JCT/QI: T6700150123879
+Switzerland: CHE-391.441.842 MWST
+United Kingdom: GB379527545
+South Korea: 553-80-03084
+South Africa: 4330322738
