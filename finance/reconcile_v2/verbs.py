@@ -17,10 +17,14 @@ the v2 toolbox is the narrow surface (#31).
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
+
+
+LOGGER = logging.getLogger("finance.reconcile_v2.verbs")
 
 from finance.reconcile_v2.adapter import (
     Adapter,
@@ -141,6 +145,11 @@ def get_tx_context(
             # situation but don't fail the whole verb.
             auto_search_note = f"auto-search skipped: {exc}"
         except Exception as exc:  # noqa: BLE001
+            # Mirror search_inbox: log once, return empty + note.
+            LOGGER.warning(
+                "get_tx_context: auto-search failed for tx_id=%s (%s: %s)",
+                tx_id, type(exc).__name__, exc,
+            )
             auto_search_note = f"auto-search failed: {type(exc).__name__}: {exc}"
 
     return {
@@ -188,14 +197,30 @@ def search_inbox(
             "search_inbox requires at least one of: vendor, amount, "
             "date_from/date_to, message_id (no full-mailbox scans)"
         )
-    mails = inbox.search(
-        mailbox=mailbox,
-        vendor=vendor,
-        amount=amount,
-        date_window=window,
-        message_id=message_id,
-        max_results=max_results,
-    )
+    try:
+        mails = inbox.search(
+            mailbox=mailbox,
+            vendor=vendor,
+            amount=amount,
+            date_window=window,
+            message_id=message_id,
+            max_results=max_results,
+        )
+    except ValueError:
+        # Inbox client raises ValueError for invalid filter combos —
+        # surface that as a ToolError so the agent sees a clean signal
+        # rather than a generic Python exception.
+        raise
+    except Exception as exc:  # noqa: BLE001
+        # Graph / network / auth failures: log once and return empty so
+        # callers (and the agent's tool budget) aren't blown up by a
+        # transient outage. Mirrors get_tx_context's auto-search policy.
+        LOGGER.warning(
+            "search_inbox: Graph search failed (%s: %s) — returning [] "
+            "for mailbox=%s vendor=%r amount=%r date_window=%r message_id=%r",
+            type(exc).__name__, exc, mailbox, vendor, amount, window, message_id,
+        )
+        return []
     return [_serialize_mail(m) for m in mails]
 
 
