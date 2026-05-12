@@ -55,7 +55,7 @@ inline guessing or fabricated tool results.
 | `list_open_txs` | TX where ignored=false and no belege_sent row exists. Also applies `ignore_rules.md` and reports `would_ignore`. |
 | `get_tx_context <tx_id>` | TX details + any existing belege_sent rows + open anomalies + a narrow inbox auto-search (vendor + amount + booking_date ± 30d). |
 | `search_inbox <args>` | Vendor / amount / date_window / message_id. Returns mail bodies + PDF text. Refuses zero-filter calls. |
-| `send_beleg --tx-id <id> --mail-file <json>` | Forward one PDF attachment to DATEV, INSERT bank.belege_sent. Idempotent on (tx_id, attachment filename). |
+| `send_beleg --tx-id <id> --mail-file <json>` | Forward one PDF attachment to DATEV, INSERT bank.belege_sent. Idempotent on (tx_id, attachment filename). **May refuse with `{sent: false, status: "already_sent", existing_belege_sent_id, matched_on}`** if the same PDF was already sent for *any* tx (matched on outlook_message_id / internet_message_id / attachment_filename+bank_tx_amount); on refuse, either `flag_anomaly` referencing `existing_belege_sent_id` or skip. |
 | `mark_ignored <tx_id> --reason "..."` | Set bank.transactions.ignored=true. One-way. |
 | `flag_anomaly --reason "..." --severity warn --tx-id <id?>` | Append one bank.agent_anomalies row. The only escalation path. |
 | `finalize_run --summary "..." --notes-json "{...}"` | Write bank.agent_reconcile_runs row + notify cron/telegram. Call exactly once at the end. |
