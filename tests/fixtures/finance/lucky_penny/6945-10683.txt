@@ -1,0 +1,60 @@
+Tax invoice PAID
+20th January 2026 - €59.50
+Lucky Penny Software LLC
+via Paddle.com
+Invoice to
+Sebastian Stuecker
+sebastian.stuecker@gmail.com
+Lineo Finance GmbH
+Neptunstr. 20a
+Moosburg, 85368 85368
+Germany
+Invoice from
+Paddle.com Market Ltd
+Judd House 18-29 Mora Street
+London EC1V 8BT
+United Kingdom
+VAT Number: DE421935467
+Payment method:
+- 8360
+VAT Number: EU372017215
+Company Number: 08172165
+Invoice details
+Invoice reference: 6945-10683
+Billing period: 20th January 2026 - 20th February 2026
+Transaction: txn_01kfdaj48ah1g4acfefe181rgx
+Currency code: EUR
+Transaction
+Product
+Qty
+Unit price
+Tax rate
+Amount
+Standard - MediatR
+20th January 2026 - 20th February 2026
+Monthly - Up to 10 Developers
+1
+€50.00
+19%
+€50.00
+Subtotal
+€50.00
+VAT
+€9.50
+Total
+€59.50
+Amount paid
+€59.50
+Tax breakdown
+Tax %
+Tax
+19%
+€9.50
+Tax total
+€9.50
+This purchase may be subject to reverse charge in the country of receipt.
+The €59.50 payment will appear on your bank/card statement as:
+PADDLE.NET* LUCKYPENNY
+If you have a problem with your order (e.g. don’t recognize the charge, suspect a fraudulent transaction, etc,) please visit paddle.net.
+Paddle.com Market Ltd, Judd House, 18-29 Mora Street, London EC1V 8BT.
+© 2026 Paddle. All rights reserved.
