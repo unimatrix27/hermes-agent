@@ -65,7 +65,32 @@ These rules are the agent's contract. Apply them mechanically; the threshold log
 - **Tool-first, never head-first.** Every fact you state about a transaction must come from a tool call in this run. Do not estimate, recall, or reason about vendors / amounts / dates from training.
 - **One side-effect path per kind.** Approvals through `approve_match`. Sends through `send_match` (always with the explicit `--datev-recipient` + `--from-mailbox` overrides — never the placeholder default). Anomalies through `flag_anomaly`. Manual escalations through `mark_manual_needed`. No alternate paths, no shell-outs, no SQL.
 - **No improvisation.** No `web` browsing (not granted anyway). No arbitrary shell commands beyond `finance-reconcile` verbs. No Python scripts. No `psql`. No new files anywhere on disk.
-- **No fallback to inline reasoning if a tool fails.** If a verb errors, capture the error and surface it via `flag_anomaly` or in the final report. Do not "just figure it out yourself."
+- **Tool failure is a hard stop, not a prompt to improvise.**
+  If any `finance-reconcile <verb>` call exits non-zero, returns no
+  output, returns malformed JSON, or returns an error envelope, you
+  MUST:
+
+    1. Call `flag_anomaly` with `severity='warn'`, `bank_tx_id` set to
+       the transaction in scope (or null if the failure was on a
+       run-scoped verb like `finalize_run`), and `reason` containing
+       the verb name and the raw error text.
+    2. Call `finalize_run` early with a summary that names the failed
+       verb and the resulting flag. Do NOT continue the workflow.
+
+  Hard prohibitions on tool failure (these have been violated before;
+  the prohibitions are absolute):
+
+    - NEVER fabricate a tool result.
+    - NEVER invent a `run_id`, `match_id`, `belege_sent.id`, or any
+      other database id you did not receive from a tool call this run.
+    - NEVER write a `summary_md` paragraph that describes an outcome
+      you did not actually observe.
+    - NEVER continue calling additional tools as if the failed tool
+      had succeeded.
+
+  This rule overrides every other instruction in this skill. If you
+  find yourself about to describe a result you did not receive,
+  STOP, flag, and exit.
 - **`search_for_missing_receipt` is called at most once per tx per run.** Never in a loop. An empty result is a complete answer.
 - **`mark_ignored` is forbidden in this skill.** The matcher already skips `ignored=true`. You will never see a candidate for an ignored tx, and you must not flip the `ignored` bit. The verb itself rejects `true → false` and refuses redundant `true → true` calls (PR #5 tool-level guard); do not attempt either path.
 - **You cannot modify this skill.** The framework enforces it via `metadata.hermes.locked: true` and the `## Subagent dispatch` heading (SOUL.md skill-mutation rule). If you believe the skill is wrong, missing steps, or out of date, say so via the `proposed_changes` argument on `finalize_run`. Never patch.

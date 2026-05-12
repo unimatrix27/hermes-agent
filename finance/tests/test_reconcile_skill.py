@@ -77,7 +77,7 @@ from finance.tools import (
     send_match,
     search_for_missing_receipt,
 )
-from finance.tools.adapter import InvalidTransition
+from finance.tools.adapter import InvalidTransition, ToolError
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -312,13 +312,51 @@ class ScriptedChild:
             ],
         }
         proposed_changes = None  # routine run; the threshold is high.
-        finalize_run(
-            self.adapter,
-            summary_md=summary_md,
-            proposed_changes=proposed_changes,
-            tool_call_summary=tool_call_summary,
-            notifier=self.notifier,
-        )
+        try:
+            finalize_run(
+                self.adapter,
+                summary_md=summary_md,
+                proposed_changes=proposed_changes,
+                tool_call_summary=tool_call_summary,
+                notifier=self.notifier,
+            )
+        except ToolError as e:
+            # SKILL.md hard rule (Tool failure is a hard stop): flag with
+            # the failed verb + raw error text, then finalize early with a
+            # truthful stub summary. Never fabricate the original result.
+            failed_verb = "finalize_run"
+            err_text = str(e)
+            flag_reason = f"{failed_verb} failed: {err_text}"
+            flag_anomaly(
+                self.adapter, tx_id=None, reason=flag_reason, severity="warn",
+            )
+            self._log(
+                "flag_anomaly", tx_id=None, reason=flag_reason, severity="warn",
+            )
+            stub_summary = (
+                f"Run aborted: {failed_verb} raised an error. Flag raised; "
+                f"no further work attempted. Error text: {err_text}"
+            )
+            stub_tcs = {
+                "month_scope":  month,
+                "model_id":     self.model_id,
+                "tool_failure": failed_verb,
+                "error":        err_text,
+            }
+            finalize_run(
+                self.adapter,
+                summary_md=stub_summary,
+                proposed_changes=None,
+                tool_call_summary=stub_tcs,
+                notifier=self.notifier,
+            )
+            self._log(
+                "finalize_run",
+                summary_md=stub_summary,
+                proposed_changes=None,
+                tool_call_summary=stub_tcs,
+            )
+            return stub_summary
         self._log(
             "finalize_run",
             summary_md=summary_md,
@@ -896,3 +934,120 @@ def test_dispatch_runner_routes_to_child(adapter, sender, notifier, tmp_path):
     # Child did real work via the verb layer.
     assert adapter.reconcile_runs, "child must have called finalize_run"
     assert adapter.belege_sent, "child must have completed the Sipgate send"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Test 10 — tool-failure hard stop (Track A from #25's live-smoke postmortem)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_tool_failure_flags_and_finalizes_without_fabrication(
+    adapter, sender, notifier, tmp_path,
+):
+    """Regression for the 2026-05-12 live cron smoke: ``finalize_run``
+    crashed on the ``--summary-md`` argparse alias gap and the agent
+    fabricated ``{run_id: 76, notifier_dispatched: true}`` as the tool
+    result, sending the fabricated id into the Telegram summary.
+
+    The SKILL.md hardened tool-failure rule prescribes: flag with
+    ``severity='warn'`` naming the failed verb + raw error, then
+    finalize early with a truthful stub summary — never fabricate a
+    result, never invent ids.
+
+    This test simulates the same shape (``finalize_run`` raises
+    ``ToolError`` on first call) and asserts the scripted child obeys
+    the rule: one flag naming the verb, no approvals/sends after the
+    failure, a finalize exit, and a summary that carries no fabricated
+    db ids.
+    """
+    _seed_sipgate_high_confidence(adapter, tmp_path)
+
+    # Make the first ``finalize_run`` raise — mirroring the live-smoke
+    # failure shape. Subsequent calls succeed (so the rule-prescribed
+    # retry with the stub summary lands a real row).
+    original_insert = adapter.insert_reconcile_run
+    insert_attempts: list[dict[str, Any]] = []
+
+    def failing_first_insert(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        insert_attempts.append(kwargs)
+        if len(insert_attempts) == 1:
+            raise ToolError(
+                "argparse: unrecognized arguments: --summary-md "
+                "(finance-reconcile finalize_run)"
+            )
+        return original_insert(*args, **kwargs)
+
+    adapter.insert_reconcile_run = failing_first_insert  # type: ignore[method-assign]
+
+    child = ScriptedChild(adapter=adapter, graph_sender=sender, notifier=notifier)
+    final_summary = child.run(month="2026-04")
+
+    names = [n for n, _ in child.tool_calls]
+
+    # 1. flag_anomaly called exactly once, naming the failed verb in its reason.
+    flag_calls = [kw for n, kw in child.tool_calls if n == "flag_anomaly"]
+    assert len(flag_calls) == 1, (
+        f"expected exactly one flag_anomaly on tool failure, got {flag_calls}"
+    )
+    assert "finalize_run" in flag_calls[0]["reason"], (
+        "flag_anomaly.reason must name the failed verb (per SKILL.md hard rule)"
+    )
+    assert flag_calls[0]["severity"] == "warn"
+    # Run-scoped failure → bank_tx_id is None.
+    assert flag_calls[0]["tx_id"] is None
+
+    # 2. No approve_match / send_match called AFTER the failure.
+    flag_pos = names.index("flag_anomaly")
+    post_flag = names[flag_pos + 1:]
+    assert "approve_match" not in post_flag, (
+        "no approvals after a tool failure (SKILL.md: do not continue the workflow)"
+    )
+    assert "send_match" not in post_flag, (
+        "no sends after a tool failure (SKILL.md: do not continue the workflow)"
+    )
+
+    # 3. Child exited via finalize_run (after the flag), not by silently dropping out.
+    assert names[-1] == "finalize_run", (
+        "child must exit via finalize_run after flagging the failure — not "
+        "silently drop"
+    )
+    assert "finalize_run" in post_flag, "the exit finalize_run must follow the flag"
+
+    # 4. No recorded summary_md embeds a fabricated db id (run_id, match_id,
+    #    belege_sent.id). Verbatim shape from the live-smoke postmortem.
+    fab_pattern = re.compile(
+        r"\b(run_id|match_id|belege_sent[._]id)[:\s=]+\d+",
+        flags=re.IGNORECASE,
+    )
+    recorded_summaries = [
+        kw["summary_md"]
+        for n, kw in child.tool_calls
+        if n == "finalize_run" and "summary_md" in kw
+    ]
+    assert recorded_summaries, "at least one finalize_run summary must be recorded"
+    for s in recorded_summaries:
+        assert not fab_pattern.search(s), (
+            f"summary_md must not embed a fabricated db id (per SKILL.md "
+            f"NEVER-invent-ids rule), got: {s!r}"
+        )
+    # The returned summary the parent would relay is also un-fabricated.
+    assert not fab_pattern.search(final_summary), (
+        f"returned summary must not embed a fabricated db id, got: {final_summary!r}"
+    )
+
+    # 5. Exactly one real reconcile_runs row was inserted — the retry's stub —
+    #    so no fabricated 'run_id: 76' phantom got persisted.
+    assert len(adapter.reconcile_runs) == 1, (
+        "first finalize_run raised before inserting; only the retry lands a row"
+    )
+    persisted = adapter.reconcile_runs[0]
+    assert "finalize_run" in persisted["summary_md"], (
+        "persisted summary must describe the failure, not fabricate success"
+    )
+
+    # 6. The anomaly was persisted with the verb-name reason.
+    assert len(adapter.anomalies) == 1
+    anom = adapter.anomalies[0]
+    assert anom["severity"] == "warn"
+    assert "finalize_run" in anom["reason"]
+    assert anom["bank_tx_id"] is None
