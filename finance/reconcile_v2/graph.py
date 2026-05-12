@@ -12,15 +12,24 @@ Two responsibilities:
   metadata.
 
 Both expose a thin Protocol so tests can use the in-memory fakes at the
-bottom of the file. The live implementations reuse the existing
-``DelegatedTokenProvider`` if present (PRs #1–#5) and otherwise fall
-back to a minimal refresh-token-grant helper baked in below — this keeps
-the v2 PR self-contained.
+bottom of the file.
+
+Auth: we reuse ``tools.microsoft_graph_auth.MicrosoftGraphTokenProvider``
+(app-only ``client_credentials``) when ``MSGRAPH_*`` credentials are
+present — that's the upstream-supported path. When they aren't (which
+is the case on the Lineo finance host: only ``LINEO_MS_TENANT_ID`` /
+``LINEO_MS_CLIENT_ID`` plus an on-disk refresh-token bundle at
+``~/.hermes/lineo-ms-tokens/sebastian.json``), we fall back to a
+delegated-refresh-token provider that quacks the same async
+``get_access_token`` interface. No new credential files are written; we
+read the existing bundle that the operator already maintains.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import logging
 import os
 import re
 import time
@@ -30,7 +39,16 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, Optional, Protocol
+from typing import Any, Optional, Protocol
+
+from tools.microsoft_graph_auth import (
+    MicrosoftGraphAuthError,
+    MicrosoftGraphConfigError,
+    MicrosoftGraphTokenProvider,
+)
+
+
+LOGGER = logging.getLogger("finance.reconcile_v2.graph")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -226,83 +244,191 @@ class FakeMailSender:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Live token provider — minimal refresh-token grant
+# Sync wrapper around the async tools/microsoft_graph_auth provider.
 # ──────────────────────────────────────────────────────────────────────
 
 
-DEFAULT_TOKEN_FILE = Path.home() / ".hermes" / "secrets" / "ms_graph_tokens.json"
-DEFAULT_GRAPH_READ_SCOPE = (
-    "User.Read Mail.Read Mail.Read.Shared offline_access"
+def _sync_get_access_token(
+    provider: Any, *, force_refresh: bool = False
+) -> str:
+    """Call ``get_access_token`` from sync code.
+
+    Accepts any provider that exposes ``get_access_token(*, force_refresh)``.
+    The shared :class:`MicrosoftGraphTokenProvider` is async; the
+    delegated fallback is async too. We bridge with ``asyncio.run`` —
+    each provider caches in memory, so subsequent calls are cheap.
+    """
+    return asyncio.run(provider.get_access_token(force_refresh=force_refresh))
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Delegated-refresh-token fallback
+#
+# When MSGRAPH_CLIENT_SECRET is not provisioned (the operator's host
+# only has LINEO_MS_TENANT_ID / LINEO_MS_CLIENT_ID plus an on-disk
+# refresh-token bundle), MicrosoftGraphTokenProvider.from_env() refuses
+# to construct. This provider drops into the same async
+# get_access_token() interface using the refresh-token grant against
+# the existing token bundle file — no new credentials, no new file.
+# ──────────────────────────────────────────────────────────────────────
+
+
+DELEGATED_TOKEN_FILE = (
+    Path.home() / ".hermes" / "lineo-ms-tokens" / "sebastian.json"
 )
-DEFAULT_GRAPH_SEND_SCOPE = (
-    "User.Read Mail.Send Mail.Send.Shared Mail.Read offline_access"
+DELEGATED_SCOPE = (
+    "User.Read Mail.Read Mail.Read.Shared Mail.Send Mail.Send.Shared "
+    "offline_access"
 )
 
 
-class TokenProvider:
-    """Lightweight refresh-token grant. Caches the access token in
-    memory and rewrites the bundle file with the rotated refresh token.
+@dataclass
+class _DelegatedRefreshTokenProvider:
+    """Async-compatible refresh-token-grant provider.
 
-    A separate instance is required per scope: Microsoft narrows the
-    access token to the requested scope set, so read-only operations
-    and send operations need different tokens.
+    Quacks like :class:`MicrosoftGraphTokenProvider`:
+    ``async get_access_token(*, force_refresh: bool = False) -> str``.
+
+    Persists the rotated refresh token back to ``token_file`` so the
+    bundle stays current across runs.
     """
 
-    def __init__(
-        self,
-        *,
-        scope: str,
-        token_file: Path = DEFAULT_TOKEN_FILE,
-        tenant_id: Optional[str] = None,
-        client_id: Optional[str] = None,
-        skew_seconds: int = 120,
-    ) -> None:
-        self.token_file = Path(token_file)
-        self.tenant_id = tenant_id or os.environ.get("LINEO_MS_TENANT_ID") or ""
-        self.client_id = client_id or os.environ.get("LINEO_MS_CLIENT_ID") or ""
-        self.scope = scope
-        self.skew_seconds = max(0, int(skew_seconds))
-        self._access_token: Optional[str] = None
-        self._expires_at: float = 0.0
+    tenant_id: str
+    client_id: str
+    token_file: Path = DELEGATED_TOKEN_FILE
+    scope: str = DELEGATED_SCOPE
+    skew_seconds: int = 120
+    _access_token: Optional[str] = field(default=None, init=False, repr=False)
+    _expires_at: float = field(default=0.0, init=False, repr=False)
 
-    def get_access_token(self, *, force_refresh: bool = False) -> str:
+    @classmethod
+    def from_env(
+        cls,
+        environ: Optional[dict[str, str]] = None,
+        *,
+        token_file: Optional[Path] = None,
+        scope: Optional[str] = None,
+    ) -> "_DelegatedRefreshTokenProvider":
+        env = environ if environ is not None else os.environ
+        # Resolve module-level defaults lazily so tests (and ops) can
+        # monkeypatch them after import.
+        resolved_token_file = Path(
+            token_file if token_file is not None else DELEGATED_TOKEN_FILE
+        )
+        resolved_scope = scope if scope is not None else DELEGATED_SCOPE
+        tenant = (env.get("LINEO_MS_TENANT_ID") or "").strip()
+        client = (env.get("LINEO_MS_CLIENT_ID") or "").strip()
+        if not tenant or not client:
+            raise MicrosoftGraphConfigError(
+                "Delegated-token fallback needs LINEO_MS_TENANT_ID + "
+                "LINEO_MS_CLIENT_ID in the environment "
+                "(load via ~/.hermes/.env)."
+            )
+        if not resolved_token_file.exists():
+            raise MicrosoftGraphConfigError(
+                f"Delegated-token bundle not found at {resolved_token_file}. "
+                "Refresh it via the operator's delegated-auth workflow "
+                "(see finance/scripts/build_fixtures.py for the device-code "
+                "bootstrap) — this module does NOT create new bundles."
+            )
+        return cls(
+            tenant_id=tenant,
+            client_id=client,
+            token_file=resolved_token_file,
+            scope=resolved_scope,
+        )
+
+    async def get_access_token(self, *, force_refresh: bool = False) -> str:
         if (
             not force_refresh
             and self._access_token is not None
             and time.time() + self.skew_seconds < self._expires_at
         ):
             return self._access_token
-        if not self.tenant_id or not self.client_id:
-            raise RuntimeError(
-                "TokenProvider needs LINEO_MS_TENANT_ID + LINEO_MS_CLIENT_ID "
-                "(load via ~/.hermes/.env)."
-            )
+        # Run the blocking refresh on a thread so we don't block the loop.
+        return await asyncio.to_thread(self._refresh_blocking)
+
+    def _refresh_blocking(self) -> str:
         bundle = json.loads(self.token_file.read_text())
+        if "refresh_token" not in bundle:
+            raise MicrosoftGraphAuthError(
+                f"Token bundle at {self.token_file} has no refresh_token; "
+                "operator must re-bootstrap."
+            )
         body = urllib.parse.urlencode({
             "client_id":     self.client_id,
             "grant_type":    "refresh_token",
             "refresh_token": bundle["refresh_token"],
             "scope":         self.scope,
         }).encode()
-        url = f"https://login.microsoftonline.com/{self.tenant_id}/oauth2/v2.0/token"
+        url = (
+            f"https://login.microsoftonline.com/{self.tenant_id}"
+            "/oauth2/v2.0/token"
+        )
         req = urllib.request.Request(
             url,
             data=body,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            payload = json.loads(resp.read().decode())
-        if "access_token" not in payload:
-            raise RuntimeError(f"refresh failed: {payload}")
-        merged = {**bundle, **payload}
-        self.token_file.write_text(json.dumps(merged, indent=2))
         try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                payload = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode(errors="replace")
+            raise MicrosoftGraphAuthError(
+                f"delegated refresh failed (HTTP {exc.code}): {detail}"
+            ) from exc
+        if "access_token" not in payload:
+            raise MicrosoftGraphAuthError(
+                f"delegated refresh response missing access_token: {payload}"
+            )
+        # Rotate the refresh token in the bundle (Azure may issue a new one).
+        merged = {**bundle, **payload}
+        try:
+            self.token_file.write_text(json.dumps(merged, indent=2))
             os.chmod(self.token_file, 0o600)
         except OSError:
-            pass
+            # Persistence failure is non-fatal — in-memory token still
+            # works for this run; next run will refresh again.
+            LOGGER.warning(
+                "could not persist rotated token bundle to %s "
+                "(continuing with in-memory token)",
+                self.token_file,
+            )
         self._access_token = payload["access_token"]
         self._expires_at = time.time() + int(payload.get("expires_in", 3600))
+        assert self._access_token is not None
         return self._access_token
+
+
+def _default_token_provider() -> Any:
+    """Pick the working Graph token provider for this host.
+
+    Preference order:
+      1. ``MicrosoftGraphTokenProvider.from_env()`` (app-only
+         ``client_credentials``) — the upstream-supported path. Requires
+         ``MSGRAPH_TENANT_ID`` / ``MSGRAPH_CLIENT_ID`` /
+         ``MSGRAPH_CLIENT_SECRET``.
+      2. :class:`_DelegatedRefreshTokenProvider` keyed off
+         ``LINEO_MS_TENANT_ID`` / ``LINEO_MS_CLIENT_ID`` and the on-disk
+         token bundle at :data:`DELEGATED_TOKEN_FILE` — the Lineo
+         finance host's working path.
+
+    Raises :class:`MicrosoftGraphConfigError` if neither set is
+    available, so the caller sees a clean configuration error instead
+    of a confusing 401 later.
+    """
+    try:
+        return MicrosoftGraphTokenProvider.from_env()
+    except MicrosoftGraphConfigError as app_only_exc:
+        try:
+            return _DelegatedRefreshTokenProvider.from_env()
+        except MicrosoftGraphConfigError as delegated_exc:
+            raise MicrosoftGraphConfigError(
+                "No Microsoft Graph credentials available. "
+                f"App-only: {app_only_exc}. "
+                f"Delegated fallback: {delegated_exc}"
+            ) from delegated_exc
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -326,13 +452,11 @@ class LiveInboxClient:
     def __init__(
         self,
         *,
-        token_provider: Optional[TokenProvider] = None,
+        token_provider: Any = None,
         blob_root: Path = DEFAULT_BLOB_ROOT,
         request: Any = None,
     ) -> None:
-        self.token_provider = token_provider or TokenProvider(
-            scope=DEFAULT_GRAPH_READ_SCOPE,
-        )
+        self.token_provider = token_provider or _default_token_provider()
         self.blob_root = Path(blob_root)
         self.blob_root.mkdir(parents=True, exist_ok=True)
         self._request = request or _http_request
@@ -430,7 +554,7 @@ class LiveInboxClient:
     # ── helpers ──
 
     def _auth_headers(self) -> dict[str, str]:
-        token = self.token_provider.get_access_token()
+        token = _sync_get_access_token(self.token_provider)
         return {"Authorization": f"Bearer {token}"}
 
     def _fetch_message(self, mailbox: str, message_id: str) -> Optional[dict[str, Any]]:
@@ -565,14 +689,12 @@ class LiveMailSender:
     def __init__(
         self,
         *,
-        token_provider: Optional[TokenProvider] = None,
+        token_provider: Any = None,
         sent_items_poll_seconds: float = 1.5,
         sent_items_max_poll: int = 8,
         request: Any = None,
     ) -> None:
-        self.token_provider = token_provider or TokenProvider(
-            scope=DEFAULT_GRAPH_SEND_SCOPE,
-        )
+        self.token_provider = token_provider or _default_token_provider()
         self.sent_items_poll_seconds = sent_items_poll_seconds
         self.sent_items_max_poll = sent_items_max_poll
         self._request = request or _http_request
@@ -612,7 +734,7 @@ class LiveMailSender:
         }
         body = json.dumps(payload).encode("utf-8")
         try:
-            access = self.token_provider.get_access_token()
+            access = _sync_get_access_token(self.token_provider)
         except Exception as exc:  # noqa: BLE001
             return SendResult(ok=False, error=f"token: {exc}", step="sendMail")
 
@@ -657,7 +779,7 @@ class LiveMailSender:
         while attempts < self.sent_items_max_poll:
             attempts += 1
             try:
-                access = self.token_provider.get_access_token()
+                access = _sync_get_access_token(self.token_provider)
             except Exception as exc:  # noqa: BLE001
                 return SendResult(
                     ok=False,

@@ -252,6 +252,93 @@ def test_search_inbox_date_pair_requires_both():
         search_inbox(inbox=inbox, vendor="X", date_from=date(2026, 4, 1))
 
 
+def test_search_inbox_swallows_graph_failures_returns_empty(caplog):
+    """A blowing-up InboxClient (e.g. transient Graph 5xx, expired
+    token) must not surface as an uncaught traceback; the verb logs and
+    returns [] to mirror get_tx_context's auto-search policy.
+    """
+    class _Boom:
+        def search(self, **kwargs):
+            raise RuntimeError("Graph messages query returned 503: b'busy'")
+
+    with caplog.at_level("WARNING", logger="finance.reconcile_v2.verbs"):
+        out = search_inbox(inbox=_Boom(), vendor="Vodafone")
+    assert out == []
+    assert any("Graph search failed" in rec.getMessage() for rec in caplog.records)
+
+
+def test_search_inbox_passes_through_value_error():
+    """ValueError from the inbox client (filter-shape problem) is a
+    caller bug, not a transient outage — let it bubble.
+    """
+    class _ValueErrorInbox:
+        def search(self, **kwargs):
+            raise ValueError("bad filter combo")
+
+    with pytest.raises(ValueError):
+        search_inbox(inbox=_ValueErrorInbox(), vendor="X")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Token-provider selection (auth boundary)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_default_token_provider_prefers_app_only(monkeypatch):
+    """When MSGRAPH_* creds are present, the shared app-only
+    provider wins — we do not silently fall through to the delegated
+    bundle.
+    """
+    from finance.reconcile_v2 import graph as graph_mod
+    from tools.microsoft_graph_auth import MicrosoftGraphTokenProvider
+
+    monkeypatch.setenv("MSGRAPH_TENANT_ID", "tenant")
+    monkeypatch.setenv("MSGRAPH_CLIENT_ID", "client")
+    monkeypatch.setenv("MSGRAPH_CLIENT_SECRET", "secret")
+    provider = graph_mod._default_token_provider()
+    assert isinstance(provider, MicrosoftGraphTokenProvider)
+
+
+def test_default_token_provider_falls_back_to_delegated(monkeypatch, tmp_path):
+    """When only LINEO_MS_* + an on-disk bundle exist (the operator's
+    real setup), we hand back the delegated provider — no error, no
+    new credential file invented.
+    """
+    from finance.reconcile_v2 import graph as graph_mod
+
+    # No app-only credentials.
+    monkeypatch.delenv("MSGRAPH_TENANT_ID", raising=False)
+    monkeypatch.delenv("MSGRAPH_CLIENT_ID", raising=False)
+    monkeypatch.delenv("MSGRAPH_CLIENT_SECRET", raising=False)
+    monkeypatch.setenv("LINEO_MS_TENANT_ID", "lineo-tenant")
+    monkeypatch.setenv("LINEO_MS_CLIENT_ID", "lineo-client")
+
+    # Existing bundle (fake) at the documented path.
+    bundle = tmp_path / "sebastian.json"
+    bundle.write_text(json.dumps({"refresh_token": "rt", "access_token": "at"}))
+    monkeypatch.setattr(graph_mod, "DELEGATED_TOKEN_FILE", bundle)
+
+    provider = graph_mod._default_token_provider()
+    assert isinstance(provider, graph_mod._DelegatedRefreshTokenProvider)
+    assert provider.token_file == bundle
+
+
+def test_default_token_provider_errors_when_neither_set(monkeypatch):
+    """No app-only + no LINEO_MS_* => clean configuration error, not a
+    confusing 401 later.
+    """
+    from finance.reconcile_v2 import graph as graph_mod
+    from tools.microsoft_graph_auth import MicrosoftGraphConfigError
+
+    for k in (
+        "MSGRAPH_TENANT_ID", "MSGRAPH_CLIENT_ID", "MSGRAPH_CLIENT_SECRET",
+        "LINEO_MS_TENANT_ID", "LINEO_MS_CLIENT_ID",
+    ):
+        monkeypatch.delenv(k, raising=False)
+    with pytest.raises(MicrosoftGraphConfigError):
+        graph_mod._default_token_provider()
+
+
 # ──────────────────────────────────────────────────────────────────────
 # 4. send_beleg
 # ──────────────────────────────────────────────────────────────────────
