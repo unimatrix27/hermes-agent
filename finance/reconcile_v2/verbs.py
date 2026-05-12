@@ -253,6 +253,21 @@ def send_beleg(
     attachment's name, we return that row unchanged (no second send,
     no second row).
 
+    Cross-tx dedup: before sending, also probe ``bank.belege_sent``
+    for any row (regardless of ``bank_tx_id``) that matches the
+    candidate PDF on ANY of, in priority order:
+
+    1. ``outlook_message_id`` (same forwarded mail),
+    2. ``internet_message_id`` (RFC-5322 Message-Id),
+    3. ``attachment_filename`` in ``attachment_filenames`` AND
+       equal ``bank_tx_amount`` (a cheap stand-in for hashing).
+
+    If any of those match — but the row is NOT a same-(tx_id,
+    attachment_name) idempotency hit — ``send_beleg`` refuses and
+    returns ``{status: "already_sent", existing_belege_sent_id, sent_at,
+    ...}``. The caller decides: link to existing, flag anomaly, or
+    override (by deleting the existing row out-of-band).
+
     Partial-failure semantics mirror the v1 ``send_match``:
 
     * step (a/b) fails → ``{sent: False, step, error}``; no row written.
@@ -303,7 +318,8 @@ def send_beleg(
     if not blob.exists():
         raise ToolError(f"attachment file {blob} not found on disk")
 
-    # Idempotency probe by (bank_tx_id, attachment filename).
+    # Idempotency probe by (bank_tx_id, attachment filename) — same TX,
+    # same PDF, prior successful send: return that row verbatim.
     existing = adapter.find_belege_sent_for_tx(tx_id)
     for row in existing:
         fnames = row.get("attachment_filenames") or []
@@ -313,6 +329,26 @@ def send_beleg(
                 "idempotent":    True,
                 "belege_sent":   row,
             }
+
+    # Cross-tx dedup probe — the same PDF was already sent for a
+    # different (or no) bank_tx_id. Refuse and let the caller decide.
+    tx_amount = float(tx["amount"]) if tx.get("amount") is not None else None
+    dup = adapter.find_belege_sent_match(
+        outlook_message_id=mail.get("outlook_message_id"),
+        internet_message_id=mail.get("internet_message_id"),
+        attachment_filename=chosen_name,
+        bank_tx_amount=tx_amount,
+    )
+    if dup is not None and dup.get("bank_tx_id") != tx_id:
+        return {
+            "sent":                     False,
+            "status":                   "already_sent",
+            "existing_belege_sent_id":  dup.get("id"),
+            "existing_bank_tx_id":      dup.get("bank_tx_id"),
+            "sent_at":                  dup.get("sent_at"),
+            "matched_on":               _match_key(dup, mail, chosen_name, tx_amount),
+            "existing_row":             dup,
+        }
 
     subject = _build_subject(tx, mail, chosen_name)
     body_text = _build_body(tx, mail, chosen_name, reasoning=reasoning)
@@ -485,6 +521,36 @@ def _validate_reason(reason: str) -> str:
     if not reason or not reason.strip():
         raise ToolError("reason must be a non-empty string")
     return reason.strip()
+
+
+def _match_key(
+    dup: Mapping[str, Any],
+    mail: Mapping[str, Any],
+    chosen_name: str,
+    tx_amount: Optional[float],
+) -> str:
+    """Which dedup key caused ``send_beleg`` to refuse.
+
+    Reported back to the caller verbatim so an LLM can decide whether
+    "same forwarded mail" vs "same PDF on a different mail" matters
+    for its downstream action.
+    """
+    o_mid = mail.get("outlook_message_id")
+    if o_mid and dup.get("outlook_message_id") == o_mid:
+        return "outlook_message_id"
+    i_mid = mail.get("internet_message_id")
+    if i_mid and dup.get("internet_message_id") == i_mid:
+        return "internet_message_id"
+    fnames = dup.get("attachment_filenames") or []
+    if chosen_name in fnames and tx_amount is not None:
+        dup_amt = dup.get("bank_tx_amount")
+        if dup_amt is not None:
+            try:
+                if abs(float(dup_amt) - float(tx_amount)) < 0.005:
+                    return "attachment_filename+bank_tx_amount"
+            except (TypeError, ValueError):
+                pass
+    return "unknown"
 
 
 def _serialize_mail(m: MailMessage) -> dict[str, Any]:

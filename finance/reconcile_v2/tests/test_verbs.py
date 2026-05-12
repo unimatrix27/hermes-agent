@@ -416,6 +416,80 @@ def test_send_beleg_rejects_ignored_tx(tmp_path):
         send_beleg(a, tx_id=300, mail=mail, sender=sender)
 
 
+def test_send_beleg_refuses_already_sent_outlook_message_id(tmp_path):
+    """Same outlook_message_id (same forwarded mail) already in
+    belege_sent for ANY tx → send_beleg refuses with already_sent.
+    """
+    a = _make_adapter()
+    # Seed a belege_sent row tied to a *different* tx_id but with the
+    # outlook_message_id we're about to try to forward.
+    a.belege_sent.append({
+        "id": 99, "bank_tx_id": 999,  # some other tx
+        "outlook_message_id": "MSG-1",
+        "internet_message_id": "<some-unrelated>",
+        "attachment_filenames": ["unrelated.pdf"],
+        "source_mailbox": "rechnung@lineo.finance",
+        "sent_at": datetime(2026, 4, 9, 8, 0, tzinfo=timezone.utc),
+        "recipient": "x@datev", "subject": "prior", "via": "agent_match",
+        "bank_tx_amount": 99.99, "bank_tx_booking_date": date(2026, 4, 9),
+        "confidence": None, "reasoning": "seeded prior",
+        "created_at": datetime(2026, 4, 9, 8, 1, tzinfo=timezone.utc),
+    })
+    a._next_belege_id = 100
+    mail = _vodafone_mail(tmp_path)  # outlook_message_id = "MSG-1"
+    sender = FakeMailSender()
+    result = send_beleg(a, tx_id=100, mail=mail, sender=sender)
+    assert result["sent"] is False
+    assert result["status"] == "already_sent"
+    assert result["existing_belege_sent_id"] == 99
+    assert result["existing_bank_tx_id"] == 999
+    assert result["matched_on"] == "outlook_message_id"
+    assert "sent_at" in result
+    # sender was NOT called
+    assert sender.sent == []
+    # No new belege_sent row was written.
+    assert {b["id"] for b in a.belege_sent} == {1, 99}
+
+
+def test_send_beleg_refuses_already_sent_filename_plus_amount(tmp_path):
+    """Same attachment filename + same bank_tx_amount as a prior send
+    for a different tx_id → send_beleg refuses with already_sent.
+    """
+    a = _make_adapter()
+    # Seed a prior send: different tx_id, same filename + same amount
+    # as the tx we'll try to forward against (tx 100, amount 39.99,
+    # attachment vodafone.pdf).
+    a.belege_sent.append({
+        "id": 77, "bank_tx_id": 555,  # some other tx
+        "outlook_message_id": "MSG-OLD",
+        "internet_message_id": "<imid-old>",
+        "attachment_filenames": ["vodafone.pdf"],
+        "source_mailbox": "rechnung@lineo.finance",
+        "sent_at": datetime(2026, 3, 11, 8, 0, tzinfo=timezone.utc),
+        "recipient": "x@datev", "subject": "prior month",
+        "via": "agent_match",
+        "bank_tx_amount": 39.99, "bank_tx_booking_date": date(2026, 3, 11),
+        "confidence": None, "reasoning": "seeded prior month",
+        "created_at": datetime(2026, 3, 11, 8, 1, tzinfo=timezone.utc),
+    })
+    a._next_belege_id = 78
+    # Build a mail whose outlook_message_id / internet_message_id are
+    # different from the seeded row, so only filename+amount can match.
+    mail = _vodafone_mail(tmp_path)
+    mail["outlook_message_id"] = "MSG-NEW"
+    mail["internet_message_id"] = "<imid-new>"
+    sender = FakeMailSender()
+    result = send_beleg(a, tx_id=100, mail=mail, sender=sender)
+    assert result["sent"] is False
+    assert result["status"] == "already_sent"
+    assert result["existing_belege_sent_id"] == 77
+    assert result["existing_bank_tx_id"] == 555
+    assert result["matched_on"] == "attachment_filename+bank_tx_amount"
+    assert sender.sent == []
+    # No new belege_sent row was written.
+    assert {b["id"] for b in a.belege_sent} == {1, 77}
+
+
 def test_send_beleg_attachment_choice_when_multiple(tmp_path):
     a = _make_adapter()
     pdf1 = tmp_path / "a.pdf"; pdf1.write_bytes(b"%PDF")

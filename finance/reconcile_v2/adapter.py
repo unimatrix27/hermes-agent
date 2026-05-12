@@ -66,6 +66,15 @@ class Adapter(Protocol):
 
     def find_belege_sent_for_tx(self, tx_id: int) -> list[dict[str, Any]]: ...
 
+    def find_belege_sent_match(
+        self,
+        *,
+        outlook_message_id: Optional[str] = None,
+        internet_message_id: Optional[str] = None,
+        attachment_filename: Optional[str] = None,
+        bank_tx_amount: Optional[float] = None,
+    ) -> Optional[dict[str, Any]]: ...
+
     def list_anomalies(
         self,
         *,
@@ -175,6 +184,57 @@ class InMemoryAdapter:
         with self._lock:
             return [deepcopy(b) for b in self.belege_sent
                     if b.get("bank_tx_id") == tx_id]
+
+    def find_belege_sent_match(
+        self,
+        *,
+        outlook_message_id: Optional[str] = None,
+        internet_message_id: Optional[str] = None,
+        attachment_filename: Optional[str] = None,
+        bank_tx_amount: Optional[float] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Cross-tx dedup probe (priority: outlook_message_id, then
+        internet_message_id, then attachment_filename + bank_tx_amount).
+        Returns the oldest matching row (by sent_at) or None.
+        """
+        with self._lock:
+            def _pick(predicate) -> Optional[dict[str, Any]]:
+                hits = [b for b in self.belege_sent if predicate(b)]
+                if not hits:
+                    return None
+                hits.sort(key=lambda r: (
+                    r.get("sent_at") or datetime.min.replace(tzinfo=timezone.utc),
+                    r.get("id") or 0,
+                ))
+                return deepcopy(hits[0])
+
+            if outlook_message_id:
+                row = _pick(lambda b: b.get("outlook_message_id") == outlook_message_id)
+                if row is not None:
+                    return row
+            if internet_message_id:
+                row = _pick(lambda b: b.get("internet_message_id") == internet_message_id)
+                if row is not None:
+                    return row
+            if attachment_filename and bank_tx_amount is not None:
+                target_amount = float(bank_tx_amount)
+
+                def _match_attach(b: dict[str, Any]) -> bool:
+                    fnames = b.get("attachment_filenames") or []
+                    if attachment_filename not in fnames:
+                        return False
+                    amt = b.get("bank_tx_amount")
+                    if amt is None:
+                        return False
+                    try:
+                        return abs(float(amt) - target_amount) < 0.005
+                    except (TypeError, ValueError):
+                        return False
+
+                row = _pick(_match_attach)
+                if row is not None:
+                    return row
+            return None
 
     def list_anomalies(
         self,
@@ -363,6 +423,61 @@ class PostgresAdapter:
                 (tx_id,),
             )
             return [dict(r) for r in cur.fetchall()]
+
+    def find_belege_sent_match(
+        self,
+        *,
+        outlook_message_id: Optional[str] = None,
+        internet_message_id: Optional[str] = None,
+        attachment_filename: Optional[str] = None,
+        bank_tx_amount: Optional[float] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Cross-tx dedup probe — returns the oldest row matching ANY
+        of (outlook_message_id), (internet_message_id), or
+        (attachment_filename in attachment_filenames AND bank_tx_amount).
+        Priority follows the argument order.
+        """
+        # outlook_message_id has highest signal — try first.
+        if outlook_message_id:
+            with self._cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM bank.belege_sent "
+                    "WHERE outlook_message_id = %s "
+                    "ORDER BY sent_at ASC, id ASC LIMIT 1",
+                    (outlook_message_id,),
+                )
+                row = cur.fetchone()
+            if row is not None:
+                return dict(row)
+        if internet_message_id:
+            with self._cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM bank.belege_sent "
+                    "WHERE internet_message_id = %s "
+                    "ORDER BY sent_at ASC, id ASC LIMIT 1",
+                    (internet_message_id,),
+                )
+                row = cur.fetchone()
+            if row is not None:
+                return dict(row)
+        if attachment_filename and bank_tx_amount is not None:
+            # ANY array element equals the chosen filename AND the
+            # recorded bank_tx_amount matches to two decimals. Cheap
+            # stand-in for hashing the PDF.
+            with self._cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM bank.belege_sent "
+                    "WHERE %s = ANY(attachment_filenames) "
+                    "  AND bank_tx_amount IS NOT NULL "
+                    "  AND ROUND(bank_tx_amount::numeric, 2) "
+                    "      = ROUND(%s::numeric, 2) "
+                    "ORDER BY sent_at ASC, id ASC LIMIT 1",
+                    (attachment_filename, float(bank_tx_amount)),
+                )
+                row = cur.fetchone()
+            if row is not None:
+                return dict(row)
+        return None
 
     def list_anomalies(
         self,
