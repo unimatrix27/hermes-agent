@@ -88,6 +88,10 @@ class Adapter(Protocol):
         self, *, tx_id: int, expect_currently: bool,
     ) -> dict[str, Any]: ...
 
+    def link_belege_sent_to_tx(
+        self, *, belege_sent_id: int, bank_tx_id: int,
+    ) -> Optional[dict[str, Any]]: ...
+
     def insert_belege_sent(
         self,
         *,
@@ -270,6 +274,24 @@ class InMemoryAdapter:
                 tx["ignored"] = not expect_currently
                 return deepcopy(tx)
             raise NotFound(f"no transaction with id {tx_id}")
+
+    def link_belege_sent_to_tx(
+        self, *, belege_sent_id: int, bank_tx_id: int,
+    ) -> Optional[dict[str, Any]]:
+        """Attach an orphan ``belege_sent`` row (``bank_tx_id IS NULL``)
+        to ``tx_id``. Returns the updated row on success; ``None`` if
+        the guard missed (row's ``bank_tx_id`` was already set by a
+        concurrent writer).
+        """
+        with self._lock:
+            for row in self.belege_sent:
+                if row.get("id") != belege_sent_id:
+                    continue
+                if row.get("bank_tx_id") is not None:
+                    return None
+                row["bank_tx_id"] = bank_tx_id
+                return deepcopy(row)
+            return None
 
     def insert_belege_sent(
         self,
@@ -533,6 +555,30 @@ class PostgresAdapter:
                 f"expected {expect_currently}"
             )
         return dict(row)
+
+    def link_belege_sent_to_tx(
+        self, *, belege_sent_id: int, bank_tx_id: int,
+    ) -> Optional[dict[str, Any]]:
+        """Atomically attach an orphan ``belege_sent`` row to ``bank_tx_id``.
+
+        The ``WHERE bank_tx_id IS NULL`` guard is what makes this safe
+        under concurrent writers — if a racing UPDATE got there first
+        we return ``None`` and the caller decides (typically: re-read +
+        treat as cross-tx conflict).
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                UPDATE bank.belege_sent
+                   SET bank_tx_id = %s
+                 WHERE id = %s AND bank_tx_id IS NULL
+             RETURNING *
+                """,
+                (bank_tx_id, belege_sent_id),
+            )
+            row = cur.fetchone()
+        self.conn.commit()
+        return dict(row) if row else None
 
     def insert_belege_sent(
         self,

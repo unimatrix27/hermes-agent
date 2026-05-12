@@ -1,6 +1,6 @@
 """Simplified finance-reconcile toolbox (closes unimatrix27/ideas#31).
 
-Re-export the 7 verbs and the test fakes so callers can ``from
+Re-export the 6 verbs and the test fakes so callers can ``from
 finance.reconcile_v2 import list_open_txs`` without poking into submodules.
 """
 from finance.reconcile_v2.adapter import (
@@ -28,7 +28,6 @@ from finance.reconcile_v2.notifier import (
 )
 from finance.reconcile_v2.verbs import (
     finalize_run,
-    flag_anomaly,
     get_tx_context,
     list_open_txs,
     mark_ignored,
@@ -57,9 +56,8 @@ __all__ = [
     "Notifier",
     "RecordingNotifier",
     "StdoutNotifier",
-    # verbs (the 7 the SKILL is allowed to call)
+    # verbs (the 6 the SKILL is allowed to call)
     "finalize_run",
-    "flag_anomaly",
     "get_tx_context",
     "list_open_txs",
     "mark_ignored",

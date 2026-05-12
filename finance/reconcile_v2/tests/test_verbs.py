@@ -8,10 +8,9 @@ Coverage:
 1. ``list_open_txs`` filters by ignored + belege_sent + ignore_rules
 2. ``get_tx_context`` returns DB + auto-search bundle
 3. ``search_inbox`` refuses zero-filter calls; vendor/date/amount work
-4. ``send_beleg`` happy path + idempotency + step-a failure + insert failure
+4. ``send_beleg`` happy path + idempotency + step-a failure + dedup-link / conflict
 5. ``mark_ignored`` blocks the true→true and true→false transitions
-6. ``flag_anomaly`` writes one row; never mutates other tables
-7. ``finalize_run`` writes one row and dispatches notification
+6. ``finalize_run`` writes one row and dispatches notification
 """
 from __future__ import annotations
 
@@ -33,7 +32,6 @@ from finance.reconcile_v2 import (
     RecordingNotifier,
     ToolError,
     finalize_run,
-    flag_anomaly,
     get_tx_context,
     list_open_txs,
     mark_ignored,
@@ -451,6 +449,74 @@ def test_send_beleg_refuses_already_sent_outlook_message_id(tmp_path):
     assert {b["id"] for b in a.belege_sent} == {1, 99}
 
 
+def test_send_beleg_links_orphan_outlook_message_id(tmp_path):
+    """The dedup row was sent by a legacy outlook_auto_rule and has
+    ``bank_tx_id IS NULL``. send_beleg must LINK the existing row to
+    the candidate tx instead of refusing or sending a second mail.
+    """
+    a = _make_adapter()
+    a.belege_sent.append({
+        "id": 55, "bank_tx_id": None,  # orphan
+        "outlook_message_id": "MSG-1",
+        "internet_message_id": None,
+        "attachment_filenames": [],
+        "source_mailbox": "rechnung@lineo.finance",
+        "sent_at": datetime(2026, 4, 9, 8, 0, tzinfo=timezone.utc),
+        "recipient": "x@datev", "subject": "WG: prior auto-rule",
+        "via": "outlook_auto_rule",
+        "bank_tx_amount": None, "bank_tx_booking_date": None,
+        "confidence": None, "reasoning": "seeded auto-rule",
+        "created_at": datetime(2026, 4, 9, 8, 1, tzinfo=timezone.utc),
+    })
+    a._next_belege_id = 56
+    mail = _vodafone_mail(tmp_path)  # outlook_message_id = "MSG-1"
+    sender = FakeMailSender()
+    result = send_beleg(a, tx_id=100, mail=mail, sender=sender)
+    assert result["sent"] is True
+    assert result["status"] == "linked_existing"
+    assert result["belege_sent_id"] == 55
+    assert result["matched_on"] == "outlook_message_id"
+    assert result["linked_from_null"] is True
+    # No mail was sent — the PDF is already in DATEV.
+    assert sender.sent == []
+    # No new belege_sent row written; the existing one is now linked.
+    assert {b["id"] for b in a.belege_sent} == {1, 55}
+    linked = next(b for b in a.belege_sent if b["id"] == 55)
+    assert linked["bank_tx_id"] == 100
+
+
+def test_send_beleg_links_orphan_filename_plus_amount(tmp_path):
+    """Orphan dedup match via filename+amount → link, don't refuse."""
+    a = _make_adapter()
+    a.belege_sent.append({
+        "id": 77, "bank_tx_id": None,  # orphan
+        "outlook_message_id": "MSG-OLD",
+        "internet_message_id": "<imid-old>",
+        "attachment_filenames": ["vodafone.pdf"],
+        "source_mailbox": "rechnung@lineo.finance",
+        "sent_at": datetime(2026, 3, 11, 8, 0, tzinfo=timezone.utc),
+        "recipient": "x@datev", "subject": "prior month",
+        "via": "outlook_auto_rule",
+        "bank_tx_amount": 39.99, "bank_tx_booking_date": date(2026, 3, 11),
+        "confidence": None, "reasoning": "seeded prior month",
+        "created_at": datetime(2026, 3, 11, 8, 1, tzinfo=timezone.utc),
+    })
+    a._next_belege_id = 78
+    mail = _vodafone_mail(tmp_path)
+    mail["outlook_message_id"] = "MSG-NEW"
+    mail["internet_message_id"] = "<imid-new>"
+    sender = FakeMailSender()
+    result = send_beleg(a, tx_id=100, mail=mail, sender=sender)
+    assert result["sent"] is True
+    assert result["status"] == "linked_existing"
+    assert result["belege_sent_id"] == 77
+    assert result["matched_on"] == "attachment_filename+bank_tx_amount"
+    assert result["linked_from_null"] is True
+    assert sender.sent == []
+    linked = next(b for b in a.belege_sent if b["id"] == 77)
+    assert linked["bank_tx_id"] == 100
+
+
 def test_send_beleg_refuses_already_sent_filename_plus_amount(tmp_path):
     """Same attachment filename + same bank_tx_amount as a prior send
     for a different tx_id → send_beleg refuses with already_sent.
@@ -545,34 +611,7 @@ def test_mark_ignored_unknown_tx():
 
 
 # ──────────────────────────────────────────────────────────────────────
-# 6. flag_anomaly
-# ──────────────────────────────────────────────────────────────────────
-
-
-def test_flag_anomaly_writes_one_row():
-    a = _make_adapter()
-    before_tx = list(a.transactions)
-    row = flag_anomaly(a, reason="ambiguous", severity="warn", tx_id=100)
-    assert row["status"] == "open"
-    assert len(a.anomalies) == 1
-    # other tables untouched
-    assert a.transactions == before_tx
-
-
-def test_flag_anomaly_unknown_tx():
-    a = _make_adapter()
-    with pytest.raises(NotFound):
-        flag_anomaly(a, reason="x", severity="warn", tx_id=9999)
-
-
-def test_flag_anomaly_rejects_bad_severity():
-    a = _make_adapter()
-    with pytest.raises(ToolError):
-        flag_anomaly(a, reason="x", severity="critical")
-
-
-# ──────────────────────────────────────────────────────────────────────
-# 7. finalize_run
+# 6. finalize_run
 # ──────────────────────────────────────────────────────────────────────
 
 
