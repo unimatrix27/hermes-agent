@@ -1,18 +1,23 @@
-"""The seven verbs of the v2 reconcile toolbox (closes unimatrix27/ideas#31).
+"""The six verbs of the v2 reconcile toolbox (closes unimatrix27/ideas#31).
 
-Strictly seven; the SKILL.md tells the LLM not to invent more. Each
+Strictly six; the SKILL.md tells the LLM not to invent more. Each
 function is a single-purpose unit of work — never compound transactions
 across tables.
 
     list_open_txs        — not ignored, no belege_sent row → returns rows
     get_tx_context       — tx details + likely-relevant mail attachments
     search_inbox         — vendor / amount / date_window → mail + attachments
-    send_beleg           — send to DATEV + write belege_sent row
+    send_beleg           — send to DATEV + write/link belege_sent row
     mark_ignored         — set transactions.ignored=true
-    flag_anomaly         — write agent_anomalies row
     finalize_run         — write agent_reconcile_runs row + notify
 
-If you find yourself adding an eighth, stop and rethink. The point of
+Anomalies are not the agent's concern; ``flag_anomaly`` was removed
+in PR #7's follow-up. ``mark_ignored`` still writes an audit row to
+``bank.agent_anomalies`` (severity=info) for human traceability, but
+the agent has no verb to surface free-form anomalies. If a TX cannot
+be resolved this run, leave it open — the next run picks it up.
+
+If you find yourself adding a seventh, stop and rethink. The point of
 the v2 toolbox is the narrow surface (#31).
 """
 from __future__ import annotations
@@ -262,17 +267,29 @@ def send_beleg(
     3. ``attachment_filename`` in ``attachment_filenames`` AND
        equal ``bank_tx_amount`` (a cheap stand-in for hashing).
 
-    If any of those match — but the row is NOT a same-(tx_id,
-    attachment_name) idempotency hit — ``send_beleg`` refuses and
-    returns ``{status: "already_sent", existing_belege_sent_id, sent_at,
-    ...}``. The caller decides: link to existing, flag anomaly, or
-    override (by deleting the existing row out-of-band).
+    If a dedup match is found, behaviour depends on the existing row's
+    ``bank_tx_id``:
+
+    * ``bank_tx_id IS NULL`` (e.g. a legacy ``outlook_auto_rule`` send
+      that was never linked) → link it: ``UPDATE bank.belege_sent SET
+      bank_tx_id = <tx_id> WHERE id = <existing_id> AND bank_tx_id IS
+      NULL`` and return ``{sent: True, status: "linked_existing",
+      belege_sent_id, ...}``. No second mail is sent; the agent treats
+      this as a successful reconcile because the PDF is already in
+      DATEV.
+    * ``bank_tx_id == tx_id`` → idempotent hit. Returns the existing
+      row verbatim.
+    * ``bank_tx_id`` set to some OTHER tx → real cross-tx conflict.
+      Refuse with ``{sent: False, status: "already_sent",
+      existing_belege_sent_id, existing_bank_tx_id, sent_at, ...}``;
+      the caller decides what to do.
 
     Partial-failure semantics mirror the v1 ``send_match``:
 
     * step (a/b) fails → ``{sent: False, step, error}``; no row written.
     * step (c) fails  → mail is out but row write failed; return the
-      partial state with ``warning`` so the agent can ``flag_anomaly``.
+      partial state with ``warning`` so the human can intervene. The
+      run notes should record the situation in ``finalize_run``.
     """
     tx = adapter.get_transaction(tx_id)
     if tx is None:
@@ -330,8 +347,10 @@ def send_beleg(
                 "belege_sent":   row,
             }
 
-    # Cross-tx dedup probe — the same PDF was already sent for a
-    # different (or no) bank_tx_id. Refuse and let the caller decide.
+    # Cross-tx dedup probe — the same PDF was already sent. Three
+    # cases: (a) the existing row has no bank_tx_id → link it; (b) it's
+    # already linked to this tx → idempotent hit; (c) it's linked to
+    # SOME OTHER tx → real conflict, refuse.
     tx_amount = float(tx["amount"]) if tx.get("amount") is not None else None
     dup = adapter.find_belege_sent_match(
         outlook_message_id=mail.get("outlook_message_id"),
@@ -339,14 +358,65 @@ def send_beleg(
         attachment_filename=chosen_name,
         bank_tx_amount=tx_amount,
     )
-    if dup is not None and dup.get("bank_tx_id") != tx_id:
+    if dup is not None:
+        dup_tx = dup.get("bank_tx_id")
+        matched_on = _match_key(dup, mail, chosen_name, tx_amount)
+        if dup_tx is None:
+            # Link the orphan row to this tx. The UPDATE is guarded by
+            # ``bank_tx_id IS NULL`` so a racing writer can't clobber a
+            # newly-attached link; on guard miss we fall through to the
+            # conflict branch below by re-reading.
+            linked = adapter.link_belege_sent_to_tx(
+                belege_sent_id=int(dup["id"]), bank_tx_id=tx_id,
+            )
+            if linked is not None:
+                return {
+                    "sent":             True,
+                    "status":           "linked_existing",
+                    "belege_sent_id":   int(linked["id"]),
+                    "belege_sent":      linked,
+                    "matched_on":       matched_on,
+                    "linked_from_null": True,
+                }
+            # Race: re-read the row and treat as conflict.
+            dup_tx = adapter.find_belege_sent_match(
+                outlook_message_id=mail.get("outlook_message_id"),
+                internet_message_id=mail.get("internet_message_id"),
+                attachment_filename=chosen_name,
+                bank_tx_amount=tx_amount,
+            )
+            if dup_tx is None or dup_tx.get("bank_tx_id") == tx_id:
+                # Lost the race to ourselves — idempotent.
+                if dup_tx is not None:
+                    return {
+                        "sent":             True,
+                        "status":           "linked_existing",
+                        "belege_sent_id":   int(dup_tx["id"]),
+                        "belege_sent":      dup_tx,
+                        "matched_on":       matched_on,
+                        "linked_from_null": False,
+                    }
+            else:
+                dup = dup_tx
+                dup_tx = dup.get("bank_tx_id")
+        if dup_tx == tx_id:
+            # Same PDF, same tx, prior send — idempotent.
+            return {
+                "sent":             True,
+                "status":           "linked_existing",
+                "belege_sent_id":   int(dup["id"]),
+                "belege_sent":      dup,
+                "matched_on":       matched_on,
+                "linked_from_null": False,
+            }
+        # dup_tx is set to some OTHER tx → real conflict.
         return {
             "sent":                     False,
             "status":                   "already_sent",
             "existing_belege_sent_id":  dup.get("id"),
-            "existing_bank_tx_id":      dup.get("bank_tx_id"),
+            "existing_bank_tx_id":      dup_tx,
             "sent_at":                  dup.get("sent_at"),
-            "matched_on":               _match_key(dup, mail, chosen_name, tx_amount),
+            "matched_on":               matched_on,
             "existing_row":             dup,
         }
 
@@ -394,7 +464,7 @@ def send_beleg(
             "warning": (
                 "the mail went out (outlook_message_id captured) but the "
                 "belege_sent audit row was NOT written. Manual intervention "
-                "required — recommend flag_anomaly."
+                "required — record this in finalize_run notes."
             ),
             "sent_metadata": _meta_to_dict(meta),
         }
@@ -446,42 +516,7 @@ def mark_ignored(
 
 
 # ──────────────────────────────────────────────────────────────────────
-# 6. flag_anomaly
-# ──────────────────────────────────────────────────────────────────────
-
-
-def flag_anomaly(
-    adapter: Adapter,
-    *,
-    reason: str,
-    severity: str = "warn",
-    tx_id: Optional[int] = None,
-    raised_by: str = "llm",
-    run_id: Optional[int] = None,
-) -> dict[str, Any]:
-    """Append one row to ``bank.agent_anomalies``.
-
-    ``severity`` is constrained to {info, warn, block} by the DB check
-    constraint and re-checked here for clearer errors.
-    """
-    reason = _validate_reason(reason)
-    if severity not in ("info", "warn", "block"):
-        raise ToolError(f"severity must be info|warn|block, got {severity!r}")
-    if tx_id is not None:
-        tx = adapter.get_transaction(tx_id)
-        if tx is None:
-            raise NotFound(f"no transaction with id {tx_id}")
-    return adapter.insert_anomaly(
-        bank_tx_id=tx_id,
-        reason=reason,
-        severity=severity,
-        raised_by=raised_by,
-        run_id=run_id,
-    )
-
-
-# ──────────────────────────────────────────────────────────────────────
-# 7. finalize_run
+# 6. finalize_run
 # ──────────────────────────────────────────────────────────────────────
 
 

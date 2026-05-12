@@ -13,7 +13,6 @@ Usage:
     finance-reconcile-v2 send_beleg --tx-id 123 --mail-file mail.json \\
         --attachment-name receipt.pdf
     finance-reconcile-v2 mark_ignored 123 --reason "Lohn — not a business expense"
-    finance-reconcile-v2 flag_anomaly --reason "..." --severity warn --tx-id 123
     finance-reconcile-v2 finalize_run --summary "..." --notes-json '{"month":"2026-04"}'
 
 Environment:
@@ -123,7 +122,7 @@ def _ignore_rules_path(args: argparse.Namespace) -> Optional[Path]:
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="finance-reconcile-v2",
-        description="Simplified reconcile toolbox — 7 verbs against the "
+        description="Simplified reconcile toolbox — 6 verbs against the "
                     "3-state TX model (#31).",
     )
     sp = p.add_subparsers(dest="verb", required=True)
@@ -175,15 +174,6 @@ def _build_parser() -> argparse.ArgumentParser:
     mi_p.add_argument("tx_id", type=int)
     mi_p.add_argument("--reason", required=True)
     mi_p.add_argument("--decided-by", dest="decided_by", default="llm")
-
-    fa_p = sp.add_parser("flag_anomaly",
-                         help="insert one bank.agent_anomalies row")
-    fa_p.add_argument("--reason", required=True)
-    fa_p.add_argument("--severity", default="warn",
-                      choices=("info", "warn", "block"))
-    fa_p.add_argument("--tx-id", dest="tx_id", type=int)
-    fa_p.add_argument("--raised-by", dest="raised_by", default="llm")
-    fa_p.add_argument("--run-id", dest="run_id", type=int)
 
     fr_p = sp.add_parser("finalize_run",
                          help="write reconcile_run row + notify")
@@ -261,9 +251,17 @@ def _run(args: argparse.Namespace) -> int:
             _emit(result)
             return 3
         bs = result.get("belege_sent") or {}
+        status = result.get("status")
         if result.get("idempotent"):
             print(f"ok: send_beleg idempotent — belege_sent id={bs.get('id')} "
                   f"already exists", file=sys.stderr)
+        elif status == "linked_existing":
+            print(
+                f"ok: send_beleg linked existing belege_sent id="
+                f"{result.get('belege_sent_id')} (matched_on="
+                f"{result.get('matched_on')}); no second mail sent",
+                file=sys.stderr,
+            )
         elif result.get("warning"):
             print(f"ok-partial: belege_sent NOT written; warning={result.get('warning')}",
                   file=sys.stderr)
@@ -287,18 +285,6 @@ def _run(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         _emit(result)
-        return 0
-
-    if v == "flag_anomaly":
-        adapter = PostgresAdapter(_connect())
-        row = verbs.flag_anomaly(
-            adapter,
-            reason=args.reason, severity=args.severity, tx_id=args.tx_id,
-            raised_by=args.raised_by, run_id=args.run_id,
-        )
-        print(f"ok: anomaly id={row['id']} severity={row['severity']} "
-              f"status=open", file=sys.stderr)
-        _emit(row)
         return 0
 
     if v == "finalize_run":
