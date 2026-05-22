@@ -26,6 +26,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import dataclasses
+from email import policy
+from email.parser import BytesParser
 import hashlib
 import json
 import os
@@ -646,6 +648,68 @@ def _is_pdf_attachment(att: Mapping[str, Any]) -> bool:
     return False
 
 
+def _is_mime_container_attachment(att: Mapping[str, Any]) -> bool:
+    """True for Graph fileAttachments that may wrap real PDF files.
+
+    DATEV e-invoice mail often appears in Graph as one top-level
+    ``smime.p7m`` / ``multipart/signed`` attachment. The actual invoice PDF is
+    nested inside that MIME object, so the indexer must treat it as a container
+    rather than skipping it as "not a PDF".
+    """
+    content_type = (att.get("contentType") or "").lower()
+    name = (att.get("name") or "").lower()
+    return (
+        content_type.startswith("multipart/")
+        or content_type == "message/rfc822"
+        or name.endswith((".p7m", ".eml"))
+    )
+
+
+def _extract_nested_file_attachments(
+    blob: bytes,
+    *,
+    parent_name: Optional[str],
+    parent_content_type: Optional[str],
+) -> list[tuple[str, Optional[str], bytes]]:
+    """Extract real file attachments from MIME container attachments.
+
+    If ``blob`` is not a parseable multipart MIME container, return [] so the
+    caller can preserve the original attachment behavior.
+    """
+    ct = (parent_content_type or "").lower()
+    name = (parent_name or "").lower()
+    looks_like_mime_container = (
+        ct.startswith("multipart/")
+        or ct == "message/rfc822"
+        or name.endswith((".p7m", ".eml"))
+        or blob.lstrip().lower().startswith(b"content-type: multipart/")
+    )
+    if not looks_like_mime_container:
+        return []
+    try:
+        msg = BytesParser(policy=policy.default).parsebytes(blob)
+    except Exception:  # noqa: BLE001
+        return []
+    if not msg.is_multipart():
+        return []
+
+    out: list[tuple[str, Optional[str], bytes]] = []
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        filename = part.get_filename()
+        disposition = (part.get_content_disposition() or "").lower()
+        part_ct = part.get_content_type()
+        if not filename and disposition != "attachment":
+            continue
+        if part_ct in {"application/pkcs7-signature", "application/x-pkcs7-signature"}:
+            continue
+        payload = part.get_payload(decode=True)
+        if payload:
+            out.append((filename or "attachment", part_ct, payload))
+    return out
+
+
 def _looks_portal_required(sender_address: Optional[str], allowlist: Sequence[str]) -> bool:
     if not sender_address:
         return False
@@ -702,9 +766,12 @@ async def _process_message(
 
     if has_attachments:
         attachments = await fetcher.list_attachments(mailbox, msg_id)
-        pdf_atts = [a for a in attachments if _is_pdf_attachment(a)]
-        if not pdf_atts and is_portal_required:
-            # Has non-PDF attachments + portal sender: treat as notification-only.
+        candidate_atts = [
+            a for a in attachments
+            if _is_pdf_attachment(a) or _is_mime_container_attachment(a)
+        ]
+        if not candidate_atts and is_portal_required:
+            # Has non-PDF/non-container attachments + portal sender: treat as notification-only.
             await _emit_portal_notification(
                 mailbox=mailbox,
                 msg_summary=msg_summary,
@@ -715,7 +782,7 @@ async def _process_message(
                 already_indexed=already_indexed,
             )
             return
-        for att in pdf_atts:
+        for att in candidate_atts:
             await _emit_attachment_candidate(
                 mailbox=mailbox,
                 msg_summary=msg_summary,
@@ -758,6 +825,7 @@ async def _emit_attachment_candidate(
     msg_id = msg_summary.get("id")
     att_id = attachment.get("id")
     att_name = attachment.get("name")
+    content_type = attachment.get("contentType")
 
     # Inline attachments arrive with contentBytes in the original page.
     inline_bytes = attachment.get("contentBytes")
@@ -765,33 +833,84 @@ async def _emit_attachment_candidate(
         import base64
 
         data = base64.b64decode(inline_bytes)
-        sha = hashlib.sha256(data).hexdigest()
-        existing = adapter.candidate_by_sha256(sha)
-        if existing is not None:
-            summary.dedup_skipped += 1
-            return
-        blob_tmp_root.mkdir(parents=True, exist_ok=True)
-        tmp_path = blob_tmp_root / f"{sha}.pdf"
-        tmp_path.write_bytes(data)
-        size_bytes = len(data)
     else:
-        # Streaming download via Graph's $value endpoint. We can't dedupe by
-        # SHA before download (the inline bytes weren't on the page), but the
-        # SHA-uniq index on receipt_candidates still keeps the table honest.
         blob_tmp_root.mkdir(parents=True, exist_ok=True)
-        tmp_path = blob_tmp_root / f"{att_id}.pdf"
-        result = await fetcher.download_attachment(mailbox, msg_id, att_id, tmp_path)
-        size_bytes = result.get("size_bytes", tmp_path.stat().st_size)
-        with tmp_path.open("rb") as fh:
-            hasher = hashlib.sha256()
-            for chunk in iter(lambda: fh.read(65536), b""):
-                hasher.update(chunk)
-            sha = hasher.hexdigest()
-        existing = adapter.candidate_by_sha256(sha)
-        if existing is not None:
-            summary.dedup_skipped += 1
-            tmp_path.unlink(missing_ok=True)
-            return
+        suffix = ".pdf" if _is_pdf_attachment(attachment) else ".bin"
+        tmp_download = blob_tmp_root / f"{att_id}{suffix}"
+        await fetcher.download_attachment(mailbox, msg_id, att_id, tmp_download)
+        data = tmp_download.read_bytes()
+        tmp_download.unlink(missing_ok=True)
+
+    if _is_mime_container_attachment(attachment) and not _is_pdf_attachment(attachment):
+        nested = _extract_nested_file_attachments(
+            data,
+            parent_name=att_name,
+            parent_content_type=content_type,
+        )
+        nested_pdfs = [
+            (name, ctype, blob)
+            for name, ctype, blob in nested
+            if (ctype or "").lower().startswith("application/pdf")
+            or (name or "").lower().endswith(".pdf")
+        ]
+        for nested_name, nested_ctype, nested_blob in nested_pdfs:
+            _emit_attachment_bytes_candidate(
+                mailbox=mailbox,
+                msg_summary=msg_summary,
+                attachment_name=nested_name,
+                content_type=nested_ctype,
+                data=nested_blob,
+                adapter=adapter,
+                blob_backend=blob_backend,
+                blob_tmp_root=blob_tmp_root,
+                parser=parser,
+                received_at=received_at,
+                summary=summary,
+            )
+        if not nested_pdfs:
+            summary.parse_failed += 1
+        return
+
+    _emit_attachment_bytes_candidate(
+        mailbox=mailbox,
+        msg_summary=msg_summary,
+        attachment_name=att_name,
+        content_type=content_type,
+        data=data,
+        adapter=adapter,
+        blob_backend=blob_backend,
+        blob_tmp_root=blob_tmp_root,
+        parser=parser,
+        received_at=received_at,
+        summary=summary,
+    )
+
+
+def _emit_attachment_bytes_candidate(
+    *,
+    mailbox: str,
+    msg_summary: Mapping[str, Any],
+    attachment_name: Optional[str],
+    content_type: Optional[str],
+    data: bytes,
+    adapter: IndexerAdapter,
+    blob_backend: BlobBackend,
+    blob_tmp_root: Path,
+    parser: Any,
+    received_at: Optional[datetime],
+    summary: RunSummary,
+) -> None:
+    att_name = attachment_name
+    msg_id = msg_summary.get("id")
+    sha = hashlib.sha256(data).hexdigest()
+    existing = adapter.candidate_by_sha256(sha)
+    if existing is not None:
+        summary.dedup_skipped += 1
+        return
+    blob_tmp_root.mkdir(parents=True, exist_ok=True)
+    tmp_path = blob_tmp_root / f"{sha}.pdf"
+    tmp_path.write_bytes(data)
+    size_bytes = len(data)
 
     blob_path = blob_backend.store(src=tmp_path, sha256=sha, original_name=att_name)
 

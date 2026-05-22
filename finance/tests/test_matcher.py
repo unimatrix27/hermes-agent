@@ -112,6 +112,19 @@ def test_identify_vendor_per_tx() -> None:
     assert identify_vendor(by_id[83]) is None
 
 
+def test_identify_vendor_recognizes_finovia_and_phenovia_alias() -> None:
+    base = {
+        "id": 448,
+        "amount": 11923.80,
+        "credit_debit": "D",
+        "booking_date": date(2026, 5, 13),
+        "remittance_information": "ReNr: 1285/30.04.26",
+        "ignored": False,
+    }
+    assert identify_vendor(Transaction.from_row({**base, "counterparty_name": "VM Finovia"})) == "finovia"
+    assert identify_vendor(Transaction.from_row({**base, "counterparty_name": "VM-Phenovia"})) == "finovia"
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Sipgate acceptance cases
 # ──────────────────────────────────────────────────────────────────────────
@@ -244,6 +257,94 @@ def test_vodafone_ignored_tx27_skipped(adapter) -> None:
     run_matcher(adapter)
     rows = _proposed_for(adapter, tx_id=27)
     assert rows == []
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Finovia / DATEV e-invoice acceptance cases
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_finovia_invoice_reference_normalizes_renr_remittance() -> None:
+    adapter = InMemoryMatcherAdapter(
+        transactions=[Transaction.from_row({
+            "id": 448,
+            "counterparty_name": "VM Finovia GmbH Steuer- und Rechtsberatung",
+            "amount": 11923.80,
+            "credit_debit": "D",
+            "booking_date": date(2026, 5, 13),
+            "remittance_information": "GL-ID: X ReNr: 1285/30.04.26 Deb : 211190",
+            "ignored": False,
+        })],
+        candidates=[Candidate(
+            id=1285,
+            parse_status="ok",
+            extracted_json={
+                "vendor": "finovia",
+                "invoice_number": "2026/1285",
+                "invoice_date": "2026-04-30",
+                "gross_amount": 11923.80,
+                "currency": "EUR",
+            },
+        )],
+    )
+
+    run_matcher(adapter)
+
+    rows = _proposed_for(adapter, tx_id=448)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["confidence"] == "very_high"
+    assert row["match_type"] == "exact_invoice_number"
+    assert row["decision_status"] == "proposed"
+    assert "invoice_no_match:2026/1285" in row["reason_codes"]
+    assert "amount_eq:11923.80" in row["reason_codes"]
+
+
+def test_matcher_repairs_stale_manual_needed_when_candidate_now_matches() -> None:
+    adapter = InMemoryMatcherAdapter(
+        transactions=[Transaction.from_row({
+            "id": 464,
+            "counterparty_name": "VM-Phenovia",
+            "amount": 2830.53,
+            "credit_debit": "D",
+            "booking_date": date(2026, 5, 13),
+            "remittance_information": "ReNr: 1190/30.04.26",
+            "ignored": False,
+        })],
+        candidates=[Candidate(
+            id=1190,
+            parse_status="ok",
+            extracted_json={
+                "vendor": "finovia",
+                "invoice_number": "2026/1190",
+                "invoice_date": "2026-04-30",
+                "gross_amount": 2830.53,
+                "currency": "EUR",
+            },
+        )],
+        matches=[{
+            "id": 77,
+            "bank_tx_id": 464,
+            "receipt_candidate_id": 1190,
+            "confidence": None,
+            "match_type": "exact_invoice_number",
+            "reason_codes": ["unsupported_attachment:smime.p7m"],
+            "decision_status": "manual_needed",
+            "decided_by": "code",
+            "legacy_meta": {"manual_needed_reason": "only unsupported smime.p7m"},
+        }],
+    )
+
+    summary = run_matcher(adapter)
+
+    assert summary.inserted == 0
+    assert summary.updated == 1
+    assert len(adapter.matches) == 1
+    row = adapter.matches[0]
+    assert row["id"] == 77
+    assert row["decision_status"] == "proposed"
+    assert row["confidence"] == "very_high"
+    assert "invoice_no_match:2026/1190" in row["reason_codes"]
 
 
 # ──────────────────────────────────────────────────────────────────────────

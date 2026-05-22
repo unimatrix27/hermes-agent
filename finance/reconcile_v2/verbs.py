@@ -23,6 +23,8 @@ the v2 toolbox is the narrow surface (#31).
 from __future__ import annotations
 
 import logging
+import os
+import re
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -124,6 +126,7 @@ def get_tx_context(
     belege_sent = adapter.find_belege_sent_for_tx(tx_id)
     anomalies = adapter.list_anomalies(tx_id=tx_id, limit=20)
 
+    mailboxes = _mailbox_targets(mailbox)
     likely_mails: list[dict[str, Any]] = []
     auto_search_note: Optional[str] = None
     if inbox is not None:
@@ -137,13 +140,26 @@ def get_tx_context(
             window = None
         vendor = tx.get("counterparty_name") or None
         try:
-            mails = inbox.search(
-                mailbox=mailbox,
+            mails = _search_all_mailboxes(
+                inbox=inbox,
+                mailboxes=mailboxes,
                 vendor=_first_vendor_token(vendor),
                 amount=float(tx["amount"]) if tx.get("amount") is not None else None,
                 date_window=window,
                 max_results=max_results,
             )
+            if not mails:
+                for ref in _invoice_reference_search_terms(tx):
+                    mails = _search_all_mailboxes(
+                        inbox=inbox,
+                        mailboxes=mailboxes,
+                        vendor=ref,
+                        amount=float(tx["amount"]) if tx.get("amount") is not None else None,
+                        date_window=window,
+                        max_results=max_results,
+                    )
+                    if mails:
+                        break
             likely_mails = [_serialize_mail(m) for m in mails]
         except ValueError as exc:
             # Zero-filter call would have been refused; surface the
@@ -164,6 +180,7 @@ def get_tx_context(
         "likely_mails":     likely_mails,
         "auto_search_note": auto_search_note,
         "mailbox":          mailbox,
+        "mailboxes_searched": mailboxes,
     }
 
 
@@ -202,9 +219,11 @@ def search_inbox(
             "search_inbox requires at least one of: vendor, amount, "
             "date_from/date_to, message_id (no full-mailbox scans)"
         )
+    mailboxes = _mailbox_targets(mailbox)
     try:
-        mails = inbox.search(
-            mailbox=mailbox,
+        mails = _search_all_mailboxes(
+            inbox=inbox,
+            mailboxes=mailboxes,
             vendor=vendor,
             amount=amount,
             date_window=window,
@@ -223,10 +242,95 @@ def search_inbox(
         LOGGER.warning(
             "search_inbox: Graph search failed (%s: %s) — returning [] "
             "for mailbox=%s vendor=%r amount=%r date_window=%r message_id=%r",
-            type(exc).__name__, exc, mailbox, vendor, amount, window, message_id,
+            type(exc).__name__, exc, ",".join(mailboxes), vendor, amount, window, message_id,
         )
         return []
     return [_serialize_mail(m) for m in mails]
+
+
+def _mailbox_targets(primary_mailbox: str) -> list[str]:
+    """Return the Lineo receipt-search mailbox fanout.
+
+    The v2 search flow must not only inspect the shared receipt inbox: in
+    practice vendor PDFs (notably Finovia/DATEV-originated invoices) often
+    land in Catrin's or Sebastian's mailbox first and are forwarded later.
+    Search all three by default, while preserving any explicit primary
+    mailbox as the first target and de-duplicating.
+    """
+    candidates = [
+        primary_mailbox,
+        os.environ.get("HERMES_RECONCILE_V2_MAILBOX"),
+        DEFAULT_SOURCE_MAILBOX,
+        os.environ.get("LINEO_SHARED_MAILBOX_RECHNUNG"),
+        os.environ.get("LINEO_MAILBOX_CATRIN"),
+        os.environ.get("LINEO_MAILBOX_SEBASTIAN"),
+        "catrin.stuecker@lineo.finance",
+        "sebastian.stuecker@lineo.finance",
+    ]
+    out: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        for part in str(candidate).split(","):
+            mailbox = part.strip()
+            key = mailbox.lower()
+            if mailbox and key not in seen:
+                out.append(mailbox)
+                seen.add(key)
+    return out
+
+
+def _search_all_mailboxes(
+    *,
+    inbox: InboxClient,
+    mailboxes: list[str],
+    vendor: Optional[str],
+    amount: Optional[float],
+    date_window: Optional[tuple[date, date]],
+    message_id: Optional[str] = None,
+    max_results: int = 25,
+) -> list[MailMessage]:
+    """Run the same narrow Graph query against every configured mailbox.
+
+    ``max_results`` is intentionally per mailbox, not global: if the shared
+    receipt inbox contains noisy hits, Catrin/Sebastian must still be searched
+    during the same verb call. Results are de-duplicated by Graph/internet id.
+    """
+    out: list[MailMessage] = []
+    seen: set[tuple[str, str]] = set()
+    for mailbox in mailboxes:
+        try:
+            hits = inbox.search(
+                mailbox=mailbox,
+                vendor=vendor,
+                amount=amount,
+                date_window=date_window,
+                message_id=message_id,
+                max_results=max_results,
+            )
+        except ValueError:
+            # Filter-shape bugs should still be visible to the caller.
+            raise
+        except Exception as exc:  # noqa: BLE001
+            # One personal mailbox may be temporarily unavailable or not yet
+            # delegated. Keep searching the remaining mailboxes so a Catrin
+            # access issue cannot hide a receipt in Rechnung/Sebastian.
+            LOGGER.warning(
+                "mailbox search failed for %s (%s: %s); continuing with remaining mailboxes",
+                mailbox, type(exc).__name__, exc,
+            )
+            continue
+        for msg in hits:
+            key = (
+                msg.outlook_message_id or "",
+                msg.internet_message_id or "",
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(msg)
+    return out
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -477,7 +581,154 @@ def send_beleg(
 
 
 # ──────────────────────────────────────────────────────────────────────
-# 5. mark_ignored
+# 5. send_match compatibility verb
+# ──────────────────────────────────────────────────────────────────────
+
+
+def send_match(
+    adapter: Adapter,
+    *,
+    match_id: int,
+    sender: MailSender,
+    attachment_name: Optional[str] = None,
+    datev_recipient: str = DEFAULT_DATEV_RECIPIENT,
+    source_mailbox: str = DEFAULT_SOURCE_MAILBOX,
+    decided_by: str = "llm",
+    reasoning: Optional[str] = None,
+) -> dict[str, Any]:
+    """Send an approved ``receipt_matches`` row via the v2 DATEV path.
+
+    The authoritative side effect remains :func:`send_beleg`: it performs
+    all duplicate probes before any mail is sent and writes/links
+    ``bank.belege_sent``. This wrapper translates a receipt candidate into
+    the mail shape expected by ``send_beleg`` and then records the audit
+    link back on ``bank.receipt_matches``.
+    """
+    bundle = adapter.get_receipt_match_with_candidate(match_id)
+    if bundle is None:
+        raise NotFound(f"no receipt_match with id {match_id}")
+    match = bundle["match"]
+    candidate = bundle.get("candidate")
+    if match.get("decision_status") == "sent" and match.get("legacy_belege_sent_id"):
+        return {"sent": True, "idempotent": True, "match": match}
+    if match.get("decision_status") != "approved":
+        raise InvalidTransition(
+            f"receipt_match {match_id} decision_status={match.get('decision_status')!r}; "
+            "send_match only sends approved matches"
+        )
+    if match.get("legacy_belege_sent_id"):
+        belege_sent_id = int(match["legacy_belege_sent_id"])
+        audit_row = adapter.get_belege_sent_by_id(belege_sent_id)
+        if audit_row is None:
+            raise ToolError(
+                f"receipt_match {match_id} points at missing belege_sent id {belege_sent_id}"
+            )
+        updated = adapter.update_receipt_match_status(
+            match_id=match_id,
+            decision_status="sent",
+            decided_by=decided_by,
+            legacy_belege_sent_id=belege_sent_id,
+            legacy_meta_patch={
+                "send_match": {
+                    "status": "linked_existing_audit",
+                    "belege_sent_id": belege_sent_id,
+                    "source": "finance-reconcile-v2",
+                }
+            },
+        )
+        return {
+            "sent": True,
+            "status": "linked_existing_audit",
+            "belege_sent_id": belege_sent_id,
+            "belege_sent": audit_row,
+            "match": updated,
+        }
+    if candidate is None:
+        raise ToolError(f"receipt_match {match_id} has no receipt_candidate to send")
+
+    mail = _candidate_to_mail(candidate)
+    result = send_beleg(
+        adapter,
+        tx_id=int(match["bank_tx_id"]),
+        mail=mail,
+        sender=sender,
+        attachment_name=attachment_name or candidate.get("attachment_name"),
+        datev_recipient=datev_recipient,
+        source_mailbox=source_mailbox or candidate.get("mailbox") or DEFAULT_SOURCE_MAILBOX,
+        decided_by=decided_by,
+        reasoning=reasoning or _send_match_reasoning(match, candidate),
+    )
+
+    belege_sent_id: Optional[int] = None
+    status = result.get("status")
+    if result.get("sent"):
+        row = result.get("belege_sent") or {}
+        belege_sent_id = result.get("belege_sent_id") or row.get("id")
+    elif status == "already_sent" and result.get("existing_belege_sent_id"):
+        # Duplicate guard did its job: the exact same mail/PDF is already in
+        # DATEV. Repair the receipt_match audit pointer without sending again.
+        belege_sent_id = int(result["existing_belege_sent_id"])
+        status = "linked_already_sent"
+    else:
+        return result
+
+    updated = adapter.update_receipt_match_status(
+        match_id=match_id,
+        decision_status="sent",
+        decided_by=decided_by,
+        legacy_belege_sent_id=int(belege_sent_id),
+        legacy_meta_patch={
+            "send_match": {
+                "status": status or "sent",
+                "belege_sent_id": int(belege_sent_id),
+                "matched_on": result.get("matched_on"),
+                "source": "finance-reconcile-v2",
+            }
+        },
+    )
+    out = dict(result)
+    out["sent"] = True
+    if status:
+        out["status"] = status
+    out["match"] = updated
+    out["belege_sent_id"] = int(belege_sent_id)
+    return out
+
+
+def approve_match(
+    adapter: Adapter,
+    *,
+    match_id: int,
+    reason: Optional[str] = None,
+    decided_by: str = "llm",
+) -> dict[str, Any]:
+    """Compatibility verb: mark a receipt_match as approved.
+
+    This intentionally does not send anything. The separate ``send_match``
+    step performs duplicate checks before DATEV side effects.
+    """
+    bundle = adapter.get_receipt_match_with_candidate(match_id)
+    if bundle is None:
+        raise NotFound(f"no receipt_match with id {match_id}")
+    match = bundle["match"]
+    if match.get("decision_status") == "sent":
+        raise InvalidTransition(f"receipt_match {match_id} is already sent")
+    if match.get("decision_status") == "approved":
+        return {"match": match, "idempotent": True}
+    meta = {"approved_by": decided_by, "source": "finance-reconcile-v2"}
+    if reason:
+        meta["approval_reason"] = reason.strip()
+    updated = adapter.update_receipt_match_status(
+        match_id=match_id,
+        decision_status="approved",
+        decided_by=decided_by,
+        legacy_meta_patch=meta,
+    )
+    return {"match": updated, "idempotent": False}
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 6. mark_ignored / manual / anomaly
 # ──────────────────────────────────────────────────────────────────────
 
 
@@ -515,8 +766,69 @@ def mark_ignored(
     return {"transaction": tx_after, "audit_anomaly": audit}
 
 
+def mark_manual_needed(
+    adapter: Adapter,
+    *,
+    tx_id: int,
+    reason: str,
+    decided_by: str = "llm",
+) -> dict[str, Any]:
+    """Record that a transaction needs human/portal handling.
+
+    Prefer updating the latest non-sent receipt_match for the tx. If no
+    row exists, create a nullable-candidate ``portal_only`` match so the
+    status view can stop treating the tx as a silently-open item.
+    """
+    reason = _validate_reason(reason)
+    tx = adapter.get_transaction(tx_id)
+    if tx is None:
+        raise NotFound(f"no transaction with id {tx_id}")
+    existing = adapter.find_latest_receipt_match_for_tx(tx_id)
+    meta = {"manual_needed_reason": reason, "source": "finance-reconcile-v2"}
+    if existing and existing.get("decision_status") != "sent":
+        match = adapter.update_receipt_match_status(
+            match_id=int(existing["id"]),
+            decision_status="manual_needed",
+            decided_by=decided_by,
+            legacy_meta_patch=meta,
+        )
+    else:
+        match = adapter.create_receipt_match(
+            bank_tx_id=tx_id,
+            decision_status="manual_needed",
+            decided_by=decided_by,
+            match_type="portal_only",
+            reason_codes=["manual_needed"],
+            legacy_meta=meta,
+        )
+    return {"transaction": tx, "match": match}
+
+
+def flag_anomaly(
+    adapter: Adapter,
+    *,
+    tx_id: Optional[int] = None,
+    reason: str,
+    severity: str = "warn",
+    decided_by: str = "llm",
+) -> dict[str, Any]:
+    """Compatibility verb for v1's anomaly escape hatch."""
+    reason = _validate_reason(reason)
+    if severity not in {"info", "warn", "block"}:
+        raise ToolError("severity must be one of: info, warn, block")
+    if tx_id is not None and adapter.get_transaction(tx_id) is None:
+        raise NotFound(f"no transaction with id {tx_id}")
+    anomaly = adapter.insert_anomaly(
+        bank_tx_id=tx_id,
+        reason=reason,
+        severity=severity,
+        raised_by=decided_by,
+    )
+    return {"anomaly": anomaly}
+
+
 # ──────────────────────────────────────────────────────────────────────
-# 6. finalize_run
+# 7. finalize_run
 # ──────────────────────────────────────────────────────────────────────
 
 
@@ -614,6 +926,46 @@ def _serialize_attachment(a: MailAttachment) -> dict[str, Any]:
     }
 
 
+def _candidate_to_mail(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    attachment_name = candidate.get("attachment_name")
+    local_path = candidate.get("local_blob_path")
+    if not attachment_name:
+        raise ToolError(f"receipt_candidate {candidate.get('id')} has no attachment_name")
+    if not local_path:
+        raise ToolError(f"receipt_candidate {candidate.get('id')} has no local_blob_path")
+    return {
+        "outlook_message_id": candidate.get("outlook_message_id"),
+        "internet_message_id": candidate.get("internet_message_id"),
+        "mailbox": candidate.get("mailbox") or DEFAULT_SOURCE_MAILBOX,
+        "from_address": candidate.get("from_email"),
+        "subject": candidate.get("subject"),
+        "received_at": candidate.get("received_at") or candidate.get("sent_at"),
+        "body_text": candidate.get("extracted_text"),
+        "has_attachments": True,
+        "attachments": [{
+            "name": attachment_name,
+            "content_type": "application/pdf",
+            "size_bytes": None,
+            "sha256": candidate.get("attachment_sha256"),
+            "local_path": local_path,
+            "extracted_text": candidate.get("extracted_text"),
+            "extract_error": candidate.get("parse_error"),
+        }],
+    }
+
+
+def _send_match_reasoning(
+    match: Mapping[str, Any], candidate: Mapping[str, Any],
+) -> str:
+    return (
+        "v2 send_match "
+        f"match_id={match.get('id')} "
+        f"tx_id={match.get('bank_tx_id')} "
+        f"candidate_id={candidate.get('id')} "
+        f"confidence={match.get('confidence')}"
+    )
+
+
 def _meta_to_dict(meta: Any) -> dict[str, Any]:
     if is_dataclass(meta):
         return asdict(meta)
@@ -645,6 +997,28 @@ def _first_vendor_token(vendor: Optional[str]) -> Optional[str]:
             break
     # Use the first space-separated word — keeps the query specific.
     return raw.split()[0] if raw else None
+
+
+def _invoice_reference_search_terms(tx: Mapping[str, Any]) -> list[str]:
+    """Extract invoice-reference search terms from bank remittance text.
+
+    Finovia/DATEV direct-debit remittance contains strings like
+    ``ReNr: 1285/30.04.26`` while the invoice mail subject/body uses
+    ``2026/1285``. Search that normalized reference if the vendor+amount
+    query comes back empty.
+    """
+    remittance = str(tx.get("remittance_information") or "")
+    terms: list[str] = []
+    for match in re.finditer(
+        r"(?i)\bReNr\s*:\s*(\d{2,})\s*/\s*(\d{1,2})\.(\d{1,2})\.(\d{2,4})",
+        remittance,
+    ):
+        number, _day, _month, year = match.groups()
+        if len(year) == 2:
+            year = f"20{year}"
+        terms.append(f"{year}/{number}")
+        terms.append(number)
+    return list(dict.fromkeys(terms))
 
 
 def _build_subject(

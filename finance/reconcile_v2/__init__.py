@@ -27,12 +27,16 @@ from finance.reconcile_v2.notifier import (
     StdoutNotifier,
 )
 from finance.reconcile_v2.verbs import (
+    approve_match,
     finalize_run,
+    flag_anomaly,
     get_tx_context,
     list_open_txs,
     mark_ignored,
+    mark_manual_needed,
     search_inbox,
     send_beleg,
+    send_match,
 )
 
 __all__ = [
@@ -56,11 +60,15 @@ __all__ = [
     "Notifier",
     "RecordingNotifier",
     "StdoutNotifier",
-    # verbs (the 6 the SKILL is allowed to call)
+    # verbs (v2 + v1 compatibility aliases)
+    "approve_match",
     "finalize_run",
+    "flag_anomaly",
     "get_tx_context",
     "list_open_txs",
     "mark_ignored",
+    "mark_manual_needed",
     "search_inbox",
     "send_beleg",
+    "send_match",
 ]

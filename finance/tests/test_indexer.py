@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from email.message import EmailMessage
 import json
 import re
 from datetime import datetime, timezone
@@ -88,6 +89,33 @@ def _build_blank_pdf(tmp_path: Path) -> bytes:
     doc.save(str(p))
     doc.close()
     return p.read_bytes()
+
+
+def _build_finovia_pdf(tmp_path: Path, *, invoice: str = "2026/1285") -> bytes:
+    snippet = (
+        "Lineo Finance GmbH\n"
+        "VM Finovia GmbH Steuer- und Rechtsberatung\n"
+        "RECHNUNG\n"
+        f"{invoice}\n"
+        "Rechnungsdatum: 30.04.2026\n"
+        "April 2026 Management Fee Pauschale 19,00 10.000,00\n"
+        "Per SEPA-Lastschrift wird der Rechnungsbetrag von 11.923,80 EUR "
+        "zum Mandat 211190000001 abgebucht.\n"
+    )
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_textbox(pymupdf.Rect(40, 40, 560, 800), snippet, fontsize=10)
+    out = tmp_path / "RE_2026_1285.pdf"
+    doc.save(str(out))
+    doc.close()
+    return out.read_bytes()
+
+
+def _wrap_pdf_in_smime_p7m(pdf_bytes: bytes, *, filename: str = "RE_2026/1285.pdf") -> bytes:
+    msg = EmailMessage()
+    msg.set_content("signed DATEV invoice container")
+    msg.add_attachment(pdf_bytes, maintype="application", subtype="pdf", filename=filename)
+    return msg.as_bytes()
 
 
 def _make_msg(
@@ -288,6 +316,46 @@ def test_pdf_attachment_writes_one_candidate_per_attachment(tmp_path: Path):
     # State persisted, delta token captured.
     state = adapter.get_state("rechnung@lineo.finance::inbox")
     assert state is not None and state.delta_token == "tok1"
+
+
+def test_smime_p7m_attachment_is_flattened_to_inner_finovia_pdf(tmp_path: Path):
+    """DATEV e-invoice mail may expose only smime.p7m at Graph's top level.
+    The indexer must flatten that wrapper and index the real inner PDF so the
+    matcher can propose the Finovia transaction without manual intervention.
+    """
+    pdf_bytes = _build_finovia_pdf(tmp_path)
+    p7m_bytes = _wrap_pdf_in_smime_p7m(pdf_bytes)
+    msg = _make_msg(
+        msg_id="finovia-msg-1285",
+        internet_message_id="<finovia-1285@example>",
+        sender="e-invoice@datev.de",
+        subject="VM Finovia GmbH Steuer- und Rechtsberatung: Ihre Rechnung 2026/1285 vom 30.04.2026",
+    )
+
+    client = FakeGraphClient()
+    client.delta_responses = [{"value": [msg], "@odata.deltaLink": "https://x?$deltatoken=tok-finovia"}]
+    client.attachments_by_message["finovia-msg-1285"] = [
+        {
+            "id": "smime-1",
+            "name": "smime.p7m",
+            "contentType": "multipart/signed",
+            "size": len(p7m_bytes),
+        }
+    ]
+    client.download_bodies[("finovia-msg-1285", "smime-1")] = p7m_bytes
+
+    adapter = InMemoryIndexerAdapter()
+    agg = run(config=_make_config(tmp_path), adapter=adapter, fetcher=_make_fetcher(client))
+
+    assert agg.scanned == 1
+    assert agg.new == 1
+    assert agg.parse_failed == 0
+    candidate = adapter.candidates[0]
+    assert candidate["attachment_name"] == "RE_2026/1285.pdf"
+    assert candidate["parse_status"] == "ok"
+    assert candidate["extracted_json"]["vendor"] == "finovia"
+    assert candidate["extracted_json"]["invoice_number"] == "2026/1285"
+    assert candidate["extracted_json"]["gross_amount"] == 11923.80
 
 
 # ──────────────────────────────────────────────────────────────────────────

@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from email import policy
+from email.parser import BytesParser
 import json
 import logging
 import os
@@ -276,6 +278,9 @@ def _sync_get_access_token(
 DELEGATED_TOKEN_FILE = (
     Path.home() / ".hermes" / "lineo-ms-tokens" / "sebastian.json"
 )
+DELEGATED_TOKEN_FILE_CATRIN = (
+    Path.home() / ".hermes" / "lineo-ms-tokens" / "catrin.json"
+)
 DELEGATED_SCOPE = (
     "User.Read Mail.Read Mail.Read.Shared Mail.Send Mail.Send.Shared "
     "offline_access"
@@ -401,7 +406,51 @@ class _DelegatedRefreshTokenProvider:
         return self._access_token
 
 
-def _default_token_provider() -> Any:
+def _delegated_token_file_for_mailbox(
+    mailbox: Optional[str],
+    environ: Optional[dict[str, str]] = None,
+) -> Path:
+    """Return the delegated token bundle that should read ``mailbox``.
+
+    The Lineo setup uses one delegated token per personal mailbox.  The shared
+    receipt mailbox remains read/sent through Sebastian's delegated token, but
+    Catrin's personal mailbox must use Catrin's own token; otherwise Graph
+    returns 403 even when ``Mail.Read`` is granted for the signed-in user.
+    """
+    env = environ if environ is not None else os.environ
+    box = (mailbox or "").strip().lower()
+    catrin_box = (
+        env.get("LINEO_MAILBOX_CATRIN") or "catrin.stuecker@lineo.finance"
+    ).strip().lower()
+    if box and (box == catrin_box or box.startswith("catrin.")):
+        return Path(
+            env.get("LINEO_MS_TOKEN_FILE_CATRIN")
+            or env.get("LINEO_MS_CATRIN_TOKEN_FILE")
+            or DELEGATED_TOKEN_FILE_CATRIN
+        )
+    return Path(
+        env.get("LINEO_MS_TOKEN_FILE_SEBASTIAN")
+        or env.get("LINEO_MS_SEBASTIAN_TOKEN_FILE")
+        or DELEGATED_TOKEN_FILE
+    )
+
+
+def _is_personal_delegated_mailbox(
+    mailbox: Optional[str],
+    environ: Optional[dict[str, str]] = None,
+) -> bool:
+    env = environ if environ is not None else os.environ
+    box = (mailbox or "").strip().lower()
+    if not box:
+        return False
+    personal = {
+        (env.get("LINEO_MAILBOX_CATRIN") or "catrin.stuecker@lineo.finance").strip().lower(),
+        (env.get("LINEO_MAILBOX_SEBASTIAN") or "sebastian.stuecker@lineo.finance").strip().lower(),
+    }
+    return box in personal or box.startswith("catrin.") or box.startswith("sebastian.")
+
+
+def _default_token_provider(mailbox: Optional[str] = None) -> Any:
     """Pick the working Graph token provider for this host.
 
     Preference order:
@@ -411,18 +460,33 @@ def _default_token_provider() -> Any:
          ``MSGRAPH_CLIENT_SECRET``.
       2. :class:`_DelegatedRefreshTokenProvider` keyed off
          ``LINEO_MS_TENANT_ID`` / ``LINEO_MS_CLIENT_ID`` and the on-disk
-         token bundle at :data:`DELEGATED_TOKEN_FILE` — the Lineo
-         finance host's working path.
+         per-mailbox token bundle under ``~/.hermes/lineo-ms-tokens`` —
+         the Lineo finance host's working path.
 
     Raises :class:`MicrosoftGraphConfigError` if neither set is
     available, so the caller sees a clean configuration error instead
     of a confusing 401 later.
     """
+    delegated_token_file = _delegated_token_file_for_mailbox(mailbox)
+    # Personal mailboxes need their own delegated token.  App-only creds may be
+    # configured for other Graph paths but still lack access to Catrin's mailbox,
+    # so don't let app-only shadow an explicitly available personal bundle.
+    if mailbox is not None and delegated_token_file != Path(DELEGATED_TOKEN_FILE):
+        try:
+            return _DelegatedRefreshTokenProvider.from_env(
+                token_file=delegated_token_file
+            )
+        except MicrosoftGraphConfigError:
+            # Fall back to app-only below if the per-user bundle is absent/bad.
+            pass
+
     try:
         return MicrosoftGraphTokenProvider.from_env()
     except MicrosoftGraphConfigError as app_only_exc:
         try:
-            return _DelegatedRefreshTokenProvider.from_env()
+            return _DelegatedRefreshTokenProvider.from_env(
+                token_file=delegated_token_file
+            )
         except MicrosoftGraphConfigError as delegated_exc:
             raise MicrosoftGraphConfigError(
                 "No Microsoft Graph credentials available. "
@@ -456,7 +520,8 @@ class LiveInboxClient:
         blob_root: Path = DEFAULT_BLOB_ROOT,
         request: Any = None,
     ) -> None:
-        self.token_provider = token_provider or _default_token_provider()
+        self.token_provider = token_provider
+        self._token_providers_by_mailbox: dict[str, Any] = {}
         self.blob_root = Path(blob_root)
         self.blob_root.mkdir(parents=True, exist_ok=True)
         self._request = request or _http_request
@@ -509,9 +574,9 @@ class LiveInboxClient:
 
         params = {k: v for k, v in params.items() if v is not None}
         qs = urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
-        url = (f"https://graph.microsoft.com/v1.0/users/{urllib.parse.quote(mailbox)}"
+        url = (f"https://graph.microsoft.com/v1.0/{self._mailbox_root(mailbox)}"
                f"/messages?{qs}")
-        headers = self._auth_headers()
+        headers = self._auth_headers(mailbox)
         # $search requires ConsistencyLevel=eventual per Graph docs.
         if vendor:
             headers["ConsistencyLevel"] = "eventual"
@@ -553,18 +618,32 @@ class LiveInboxClient:
 
     # ── helpers ──
 
-    def _auth_headers(self) -> dict[str, str]:
-        token = _sync_get_access_token(self.token_provider)
+    def _token_provider_for_mailbox(self, mailbox: Optional[str]) -> Any:
+        if self.token_provider is not None:
+            return self.token_provider
+        key = (mailbox or "").strip().lower()
+        if key not in self._token_providers_by_mailbox:
+            self._token_providers_by_mailbox[key] = _default_token_provider(mailbox)
+        return self._token_providers_by_mailbox[key]
+
+    def _auth_headers(self, mailbox: Optional[str] = None) -> dict[str, str]:
+        token = _sync_get_access_token(self._token_provider_for_mailbox(mailbox))
         return {"Authorization": f"Bearer {token}"}
+
+    def _mailbox_root(self, mailbox: str) -> str:
+        provider = self._token_provider_for_mailbox(mailbox)
+        if isinstance(provider, _DelegatedRefreshTokenProvider) and _is_personal_delegated_mailbox(mailbox):
+            return "me"
+        return f"users/{urllib.parse.quote(mailbox)}"
 
     def _fetch_message(self, mailbox: str, message_id: str) -> Optional[dict[str, Any]]:
         url = (
-            f"https://graph.microsoft.com/v1.0/users/{urllib.parse.quote(mailbox)}"
+            f"https://graph.microsoft.com/v1.0/{self._mailbox_root(mailbox)}"
             f"/messages/{urllib.parse.quote(message_id)}"
             "?$select=id,internetMessageId,from,subject,receivedDateTime,body,hasAttachments"
         )
         status, body = self._request(
-            method="GET", url=url, headers=self._auth_headers(), body=None,
+            method="GET", url=url, headers=self._auth_headers(mailbox), body=None,
         )
         if status == 404:
             return None
@@ -615,11 +694,11 @@ class LiveInboxClient:
         self, mailbox: str, message_id: str,
     ) -> list[MailAttachment]:
         url = (
-            f"https://graph.microsoft.com/v1.0/users/{urllib.parse.quote(mailbox)}"
+            f"https://graph.microsoft.com/v1.0/{self._mailbox_root(mailbox)}"
             f"/messages/{urllib.parse.quote(message_id)}/attachments"
         )
         status, body = self._request(
-            method="GET", url=url, headers=self._auth_headers(), body=None,
+            method="GET", url=url, headers=self._auth_headers(mailbox), body=None,
         )
         if status != 200:
             raise RuntimeError(
@@ -648,25 +727,71 @@ class LiveInboxClient:
                     extract_error=f"b64 decode failed: {exc}",
                 ))
                 continue
-            sha = _sha256_hex(blob)
-            local = self.blob_root / f"{sha}.bin"
-            try:
-                if not local.exists():
-                    local.write_bytes(blob)
-            except OSError as exc:
-                out.append(MailAttachment(
-                    name=name, content_type=ctype, size_bytes=size,
-                    sha256=sha, local_path=None, extracted_text=None,
-                    extract_error=f"local write failed: {exc}",
-                ))
-                continue
-            text, err = _extract_text(local, ctype)
-            out.append(MailAttachment(
-                name=name, content_type=ctype, size_bytes=size,
-                sha256=sha, local_path=str(local),
-                extracted_text=text, extract_error=err,
+            out.extend(self._materialize_attachment_blob(
+                name=name, content_type=ctype, size_bytes=size, blob=blob,
             ))
         return out
+
+    def _materialize_attachment_blob(
+        self,
+        *,
+        name: str,
+        content_type: Optional[str],
+        size_bytes: Optional[int],
+        blob: bytes,
+    ) -> list[MailAttachment]:
+        """Persist an attachment, flattening signed-MIME wrappers.
+
+        DATEV e-invoice mails can arrive from Graph as a single top-level
+        ``smime.p7m`` / ``multipart/signed`` attachment. That object is itself
+        a MIME document: the real invoice PDF is nested below a
+        ``multipart/mixed`` part, followed by an ``smime.p7s`` signature. Treat
+        such wrappers as containers so search/matching and ``send_beleg`` see
+        the actual PDF attachment instead of an unsupported signature envelope.
+        """
+        nested = _extract_nested_file_attachments(
+            blob, parent_name=name, parent_content_type=content_type,
+        )
+        if nested:
+            return [
+                self._persist_attachment(
+                    name=n_name,
+                    content_type=n_ctype,
+                    size_bytes=len(n_blob),
+                    blob=n_blob,
+                )
+                for n_name, n_ctype, n_blob in nested
+            ]
+
+        return [self._persist_attachment(
+            name=name, content_type=content_type, size_bytes=size_bytes, blob=blob,
+        )]
+
+    def _persist_attachment(
+        self,
+        *,
+        name: str,
+        content_type: Optional[str],
+        size_bytes: Optional[int],
+        blob: bytes,
+    ) -> MailAttachment:
+        sha = _sha256_hex(blob)
+        local = self.blob_root / f"{sha}.bin"
+        try:
+            if not local.exists():
+                local.write_bytes(blob)
+        except OSError as exc:
+            return MailAttachment(
+                name=name, content_type=content_type, size_bytes=size_bytes,
+                sha256=sha, local_path=None, extracted_text=None,
+                extract_error=f"local write failed: {exc}",
+            )
+        text, err = _extract_text(local, content_type)
+        return MailAttachment(
+            name=name, content_type=content_type, size_bytes=size_bytes,
+            sha256=sha, local_path=str(local),
+            extracted_text=text, extract_error=err,
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -855,6 +980,57 @@ def _http_request(
 def _sha256_hex(blob: bytes) -> str:
     import hashlib
     return hashlib.sha256(blob).hexdigest()
+
+
+def _extract_nested_file_attachments(
+    blob: bytes,
+    *,
+    parent_name: str,
+    parent_content_type: Optional[str],
+) -> list[tuple[str, Optional[str], bytes]]:
+    """Return real file attachments hidden inside MIME container attachments.
+
+    Microsoft Graph sometimes exposes signed e-invoice messages as one
+    ``smime.p7m`` fileAttachment whose bytes are a ``multipart/signed`` MIME
+    document. The invoice PDF is a normal nested MIME attachment inside that
+    document. If the top-level blob is not such a container, return ``[]`` so
+    callers preserve the original attachment behavior.
+    """
+    ct = (parent_content_type or "").lower()
+    name = (parent_name or "").lower()
+    looks_like_mime_container = (
+        ct.startswith("multipart/")
+        or ct == "message/rfc822"
+        or name.endswith((".p7m", ".eml"))
+        or blob.lstrip().lower().startswith(b"content-type: multipart/")
+    )
+    if not looks_like_mime_container:
+        return []
+
+    try:
+        msg = BytesParser(policy=policy.default).parsebytes(blob)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.debug("could not parse nested MIME attachment %s: %s", parent_name, exc)
+        return []
+    if not msg.is_multipart():
+        return []
+
+    out: list[tuple[str, Optional[str], bytes]] = []
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        filename = part.get_filename()
+        content_disposition = (part.get_content_disposition() or "").lower()
+        part_ct = part.get_content_type()
+        if not filename and content_disposition != "attachment":
+            continue
+        if part_ct in {"application/pkcs7-signature", "application/x-pkcs7-signature"}:
+            continue
+        payload = part.get_payload(decode=True)
+        if not payload:
+            continue
+        out.append((filename or "attachment", part_ct, payload))
+    return out
 
 
 def _amount_candidates(amount: float) -> list[str]:

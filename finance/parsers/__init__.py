@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Mapping, Optional
 
-from . import lucky_penny, notion, sipgate, vodafone
+from . import finovia, lucky_penny, notion, sipgate, vodafone
 
 VendorParser = Callable[[str, Mapping[str, Any]], Optional[dict]]
 
@@ -21,6 +21,7 @@ VENDOR_PARSERS: dict[str, VendorParser] = {
     "notion": notion.parse,
     "lucky_penny": lucky_penny.parse,
     "vodafone": vodafone.parse,
+    "finovia": finovia.parse,
 }
 
 
@@ -50,6 +51,11 @@ def detect_vendor(extracted_text: str, email_meta: Mapping[str, Any]) -> str | N
         return "vodafone"
     if "vodafone gmbh" in text.lower() or "meinvodafone" in text.lower():
         return "vodafone"
+
+    if "finovia" in sender or "finovia" in subject or "finovia" in attachment:
+        return "finovia"
+    if "vm finovia" in text.lower() or "vm-finovia" in text.lower():
+        return "finovia"
 
     return None
 

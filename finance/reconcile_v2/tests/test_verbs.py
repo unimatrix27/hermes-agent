@@ -31,12 +31,16 @@ from finance.reconcile_v2 import (
     NotFound,
     RecordingNotifier,
     ToolError,
+    approve_match,
     finalize_run,
     get_tx_context,
     list_open_txs,
     mark_ignored,
+    flag_anomaly,
+    mark_manual_needed,
     search_inbox,
     send_beleg,
+    send_match,
 )
 
 
@@ -95,6 +99,42 @@ def _make_adapter() -> InMemoryAdapter:
     })
     a._next_belege_id = 2
     return a
+
+
+def _seed_approved_match(a: InMemoryAdapter, tmp_path: Path, *, tx_id: int = 100) -> int:
+    pdf = tmp_path / "approved-vodafone.pdf"
+    pdf.write_bytes(b"%PDF-approved")
+    a.receipt_candidates.append({
+        "id": 10,
+        "source_system": "graph",
+        "mailbox": "rechnung@lineo.finance",
+        "outlook_message_id": "APPROVED-MSG-1",
+        "internet_message_id": "<approved-imid-1>",
+        "received_at": datetime(2026, 4, 11, 8, 0, tzinfo=timezone.utc),
+        "from_email": "billing@vodafone.de",
+        "subject": "Ihre Vodafone Rechnung",
+        "attachment_name": "approved-vodafone.pdf",
+        "attachment_sha256": "sha-approved",
+        "local_blob_path": str(pdf),
+        "extracted_text": "Rechnungsbetrag 39,99 EUR",
+        "extracted_json": {},
+        "parse_status": "ok",
+    })
+    a.receipt_matches.append({
+        "id": 20,
+        "receipt_candidate_id": 10,
+        "bank_tx_id": tx_id,
+        "confidence": "high",
+        "match_type": "exact_amount_date",
+        "reason_codes": ["amount", "vendor", "date"],
+        "decision_status": "approved",
+        "decided_by": "llm",
+        "legacy_belege_sent_id": None,
+        "legacy_meta": {},
+        "created_at": datetime(2026, 4, 12, tzinfo=timezone.utc),
+        "updated_at": datetime(2026, 4, 12, tzinfo=timezone.utc),
+    })
+    return 20
 
 
 def _empty_rules_path(tmp_path: Path) -> Path:
@@ -178,6 +218,70 @@ def test_get_tx_context_bundles_db_and_inbox(tmp_path):
     assert call["date_window"] is not None
 
 
+def test_get_tx_context_searches_shared_catrin_and_sebastian_mailboxes(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINEO_MAILBOX_CATRIN", "catrin@example.test")
+    monkeypatch.setenv("LINEO_MAILBOX_SEBASTIAN", "sebastian@example.test")
+    a = _make_adapter()
+    inbox = FakeInboxClient(messages_by_mailbox={
+        "rechnung@lineo.finance": [],
+        "catrin@example.test": [MailMessage(
+            outlook_message_id="CATRIN-MSG", internet_message_id=None,
+            mailbox="catrin@example.test",
+            from_address="billing@vodafone.de", subject="Vodafone Rechnung",
+            received_at=datetime(2026, 4, 11, 8, 0, tzinfo=timezone.utc),
+            body_text="Rechnungsbetrag 39,99 EUR", has_attachments=False,
+        )],
+        "sebastian@example.test": [],
+    })
+
+    ctx = get_tx_context(a, 100, inbox=inbox)
+
+    assert [m["outlook_message_id"] for m in ctx["likely_mails"]] == ["CATRIN-MSG"]
+    searched = [call["mailbox"] for call in inbox.search_calls]
+    assert searched[:3] == [
+        "rechnung@lineo.finance",
+        "catrin@example.test",
+        "sebastian@example.test",
+    ]
+    assert ctx["mailboxes_searched"][:3] == searched[:3]
+
+
+def test_get_tx_context_falls_back_to_invoice_reference_from_remittance(tmp_path):
+    a = _make_adapter()
+    a.transactions.append({
+        "id": 448, "amount": 11923.80, "signed_amount": -11923.80,
+        "currency": "EUR", "credit_debit": "D",
+        "booking_date": date(2026, 5, 13),
+        "counterparty_name": "VM Finovia GmbH Steuer- und Rechtsberatung",
+        "counterparty_iban": "DE66120300001064572975",
+        "remittance_information": "GL-ID: X ReNr: 1285/30.04.26 Deb : 211190",
+        "ignored": False,
+    })
+    pdf = tmp_path / "finovia.pdf"
+    pdf.write_bytes(b"%PDF-fake")
+    inbox = FakeInboxClient(messages_by_mailbox={
+        "rechnung@lineo.finance": [MailMessage(
+            outlook_message_id="FINOVIA-1285", internet_message_id=None,
+            mailbox="rechnung@lineo.finance",
+            from_address="e-invoice@datev.de",
+            subject="DATEV: Ihre Rechnung 2026/1285 vom 30.04.2026",
+            received_at=datetime(2026, 5, 7, 8, 0, tzinfo=timezone.utc),
+            body_text="Rechnungsnummer 2026/1285 Betrag 11.923,80 EUR",
+            has_attachments=True,
+            attachments=[MailAttachment(
+                name="RE_2026/1285.pdf", content_type="application/pdf",
+                size_bytes=12, sha256="sha-finovia", local_path=str(pdf),
+                extracted_text="Rechnungsnummer 2026/1285 Betrag 11.923,80 EUR",
+            )],
+        )],
+    })
+
+    ctx = get_tx_context(a, 448, inbox=inbox)
+
+    assert [m["outlook_message_id"] for m in ctx["likely_mails"]] == ["FINOVIA-1285"]
+    assert any(call["vendor"] == "2026/1285" for call in inbox.search_calls)
+
+
 def test_get_tx_context_unknown_tx():
     a = _make_adapter()
     with pytest.raises(NotFound):
@@ -244,6 +348,43 @@ def test_search_inbox_amount_match():
     assert [m["outlook_message_id"] for m in out] == ["A"]
 
 
+def test_search_inbox_fans_out_to_catrin_and_sebastian(monkeypatch):
+    monkeypatch.setenv("LINEO_MAILBOX_CATRIN", "catrin@example.test")
+    monkeypatch.setenv("LINEO_MAILBOX_SEBASTIAN", "sebastian@example.test")
+    inbox = FakeInboxClient(messages_by_mailbox={
+        "rechnung@lineo.finance": [],
+        "catrin@example.test": [MailMessage(
+            outlook_message_id="A", internet_message_id="<same-message>",
+            mailbox="catrin@example.test",
+            from_address="x@vm-finovia.de", subject="Finovia Rechnung 2026/1285",
+            received_at=datetime(2026, 5, 1, tzinfo=timezone.utc),
+            body_text="Zu zahlender Betrag 11.923,80 EUR", has_attachments=False,
+        )],
+        "sebastian@example.test": [MailMessage(
+            outlook_message_id="A", internet_message_id="<same-message>",
+            mailbox="sebastian@example.test",
+            from_address="x@vm-finovia.de", subject="Finovia Rechnung 2026/1285",
+            received_at=datetime(2026, 5, 1, tzinfo=timezone.utc),
+            body_text="Zu zahlender Betrag 11.923,80 EUR", has_attachments=False,
+        )],
+    })
+
+    out = search_inbox(
+        inbox=inbox,
+        vendor="Finovia",
+        amount=11923.80,
+        date_from=date(2026, 4, 20),
+        date_to=date(2026, 5, 19),
+    )
+
+    assert [m["outlook_message_id"] for m in out] == ["A"]
+    assert [call["mailbox"] for call in inbox.search_calls][:3] == [
+        "rechnung@lineo.finance",
+        "catrin@example.test",
+        "sebastian@example.test",
+    ]
+
+
 def test_search_inbox_date_pair_requires_both():
     inbox = FakeInboxClient(messages_by_mailbox={})
     with pytest.raises(ToolError):
@@ -262,7 +403,7 @@ def test_search_inbox_swallows_graph_failures_returns_empty(caplog):
     with caplog.at_level("WARNING", logger="finance.reconcile_v2.verbs"):
         out = search_inbox(inbox=_Boom(), vendor="Vodafone")
     assert out == []
-    assert any("Graph search failed" in rec.getMessage() for rec in caplog.records)
+    assert any("mailbox search failed" in rec.getMessage() for rec in caplog.records)
 
 
 def test_search_inbox_passes_through_value_error():
@@ -319,6 +460,69 @@ def test_default_token_provider_falls_back_to_delegated(monkeypatch, tmp_path):
     provider = graph_mod._default_token_provider()
     assert isinstance(provider, graph_mod._DelegatedRefreshTokenProvider)
     assert provider.token_file == bundle
+
+
+def test_default_token_provider_uses_catrin_bundle_for_catrin_mailbox(monkeypatch, tmp_path):
+    from finance.reconcile_v2 import graph as graph_mod
+
+    monkeypatch.delenv("MSGRAPH_TENANT_ID", raising=False)
+    monkeypatch.delenv("MSGRAPH_CLIENT_ID", raising=False)
+    monkeypatch.delenv("MSGRAPH_CLIENT_SECRET", raising=False)
+    monkeypatch.setenv("LINEO_MS_TENANT_ID", "lineo-tenant")
+    monkeypatch.setenv("LINEO_MS_CLIENT_ID", "lineo-client")
+    monkeypatch.setenv("LINEO_MAILBOX_CATRIN", "catrin@example.test")
+
+    sebastian_bundle = tmp_path / "sebastian.json"
+    catrin_bundle = tmp_path / "catrin.json"
+    sebastian_bundle.write_text(json.dumps({"refresh_token": "sebastian-rt"}))
+    catrin_bundle.write_text(json.dumps({"refresh_token": "catrin-rt"}))
+    monkeypatch.setattr(graph_mod, "DELEGATED_TOKEN_FILE", sebastian_bundle)
+    monkeypatch.setattr(graph_mod, "DELEGATED_TOKEN_FILE_CATRIN", catrin_bundle)
+
+    provider = graph_mod._default_token_provider("catrin@example.test")
+    assert isinstance(provider, graph_mod._DelegatedRefreshTokenProvider)
+    assert provider.token_file == catrin_bundle
+
+
+def test_live_inbox_client_routes_auth_by_mailbox(monkeypatch, tmp_path):
+    from finance.reconcile_v2 import graph as graph_mod
+
+    class Provider:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        async def get_access_token(self, *, force_refresh: bool = False) -> str:
+            return self.name
+
+    created = []
+
+    def fake_default(mailbox=None):
+        created.append(mailbox)
+        return Provider(str(mailbox))
+
+    seen_auth = []
+
+    def fake_request(*, method, url, headers, body):
+        seen_auth.append(headers["Authorization"])
+        return 200, b'{"value": []}'
+
+    monkeypatch.setattr(graph_mod, "_default_token_provider", fake_default)
+    client = graph_mod.LiveInboxClient(blob_root=tmp_path, request=fake_request)
+
+    client.search(
+        mailbox="rechnung@lineo.finance", vendor="Finovia", amount=None,
+        date_window=None,
+    )
+    client.search(
+        mailbox="catrin@example.test", vendor="Finovia", amount=None,
+        date_window=None,
+    )
+
+    assert created == ["rechnung@lineo.finance", "catrin@example.test"]
+    assert seen_auth == [
+        "Bearer rechnung@lineo.finance",
+        "Bearer catrin@example.test",
+    ]
 
 
 def test_default_token_provider_errors_when_neither_set(monkeypatch):
@@ -585,8 +789,92 @@ def test_send_beleg_attachment_choice_when_multiple(tmp_path):
     assert sender.sent[0]["attachment_name"] == "b.pdf"
 
 
+def test_approve_match_updates_non_sent_match(tmp_path):
+    a = _make_adapter()
+    match_id = _seed_approved_match(a, tmp_path)
+    a.receipt_matches[0]["decision_status"] = "proposed"
+
+    result = approve_match(a, match_id=match_id, reason="human approved")
+
+    assert result["idempotent"] is False
+    assert result["match"]["decision_status"] == "approved"
+    assert result["match"]["legacy_meta"]["approval_reason"] == "human approved"
+
+
+def test_send_match_repairs_approved_match_with_existing_audit_without_candidate(tmp_path):
+    a = _make_adapter()
+    match_id = _seed_approved_match(a, tmp_path)
+    a.receipt_matches[0]["receipt_candidate_id"] = None
+    a.receipt_matches[0]["legacy_belege_sent_id"] = 42
+    a.belege_sent.append({
+        "id": 42,
+        "bank_tx_id": 100,
+        "outlook_message_id": "LEGACY-MSG",
+        "internet_message_id": "<legacy>",
+        "attachment_filenames": ["legacy.pdf"],
+        "source_mailbox": "rechnung@lineo.finance",
+        "sent_at": datetime(2026, 4, 9, 8, 0, tzinfo=timezone.utc),
+        "recipient": "x@datev", "subject": "prior", "via": "agent_match",
+        "bank_tx_amount": 39.99, "bank_tx_booking_date": date(2026, 4, 9),
+        "confidence": None, "reasoning": "seeded prior",
+        "created_at": datetime(2026, 4, 9, 8, 1, tzinfo=timezone.utc),
+    })
+    sender = FakeMailSender()
+
+    result = send_match(a, match_id=match_id, sender=sender)
+
+    assert result["sent"] is True
+    assert result["status"] == "linked_existing_audit"
+    assert result["match"]["decision_status"] == "sent"
+    assert result["match"]["legacy_belege_sent_id"] == 42
+    assert sender.sent == []
+
+
+def test_send_match_sends_approved_match_and_marks_sent(tmp_path):
+    a = _make_adapter()
+    match_id = _seed_approved_match(a, tmp_path)
+    sender = FakeMailSender()
+
+    result = send_match(a, match_id=match_id, sender=sender)
+
+    assert result["sent"] is True
+    assert result["match"]["decision_status"] == "sent"
+    assert result["match"]["legacy_belege_sent_id"] == result["belege_sent"]["id"]
+    assert result["belege_sent"]["bank_tx_id"] == 100
+    assert len(sender.sent) == 1
+
+
+def test_send_match_duplicate_repairs_match_link_without_resending(tmp_path):
+    a = _make_adapter()
+    match_id = _seed_approved_match(a, tmp_path)
+    a.belege_sent.append({
+        "id": 996,
+        "bank_tx_id": 53,
+        "outlook_message_id": "APPROVED-MSG-1",
+        "internet_message_id": "<approved-imid-1>",
+        "attachment_filenames": ["approved-vodafone.pdf"],
+        "source_mailbox": "rechnung@lineo.finance",
+        "sent_at": datetime(2026, 4, 9, 8, 0, tzinfo=timezone.utc),
+        "recipient": "x@datev", "subject": "prior", "via": "agent_match",
+        "bank_tx_amount": 39.99, "bank_tx_booking_date": date(2026, 4, 9),
+        "confidence": None, "reasoning": "seeded prior",
+        "created_at": datetime(2026, 4, 9, 8, 1, tzinfo=timezone.utc),
+    })
+    sender = FakeMailSender()
+
+    result = send_match(a, match_id=match_id, sender=sender)
+
+    assert result["sent"] is True
+    assert result["status"] == "linked_already_sent"
+    assert result["match"]["decision_status"] == "sent"
+    assert result["match"]["legacy_belege_sent_id"] == 996
+    assert sender.sent == []
+    # Do not clobber the authoritative historical audit row's tx link.
+    assert next(b for b in a.belege_sent if b["id"] == 996)["bank_tx_id"] == 53
+
+
 # ──────────────────────────────────────────────────────────────────────
-# 5. mark_ignored
+# 5. mark_ignored / manual_needed / anomalies
 # ──────────────────────────────────────────────────────────────────────
 
 
@@ -608,6 +896,31 @@ def test_mark_ignored_unknown_tx():
     a = _make_adapter()
     with pytest.raises(NotFound):
         mark_ignored(a, tx_id=9999, reason="?")
+
+
+def test_mark_manual_needed_updates_existing_match():
+    a = _make_adapter()
+    a.receipt_matches.append({
+        "id": 31, "receipt_candidate_id": None, "bank_tx_id": 100,
+        "confidence": None, "match_type": "manual",
+        "reason_codes": [], "decision_status": "proposed", "decided_by": "llm",
+        "legacy_belege_sent_id": None, "legacy_meta": {},
+    })
+
+    result = mark_manual_needed(a, tx_id=100, reason="portal receipt needed")
+
+    assert result["match"]["id"] == 31
+    assert result["match"]["decision_status"] == "manual_needed"
+    assert result["match"]["legacy_meta"]["manual_needed_reason"] == "portal receipt needed"
+
+
+def test_flag_anomaly_inserts_warn_anomaly():
+    a = _make_adapter()
+    result = flag_anomaly(a, tx_id=100, reason="ambiguous duplicate", severity="warn")
+
+    assert result["anomaly"]["bank_tx_id"] == 100
+    assert result["anomaly"]["severity"] == "warn"
+    assert result["anomaly"]["reason"] == "ambiguous duplicate"
 
 
 # ──────────────────────────────────────────────────────────────────────

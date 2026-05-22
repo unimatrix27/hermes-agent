@@ -31,6 +31,9 @@ VENDOR_COUNTERPARTY_SUBSTRINGS: dict[str, tuple[str, ...]] = {
     "notion":      ("NOTION LABS",),
     "lucky_penny": ("PADDLE.NET* LUCKYPENNY", "LUCKYPENNY"),
     "vodafone":    ("Vodafone GmbH", "VODAFONE"),
+    # Bank data has appeared with both the correct vendor spelling and a
+    # VM-Phenovia typo/alias; both refer to the same DATEV-originated invoices.
+    "finovia":     ("VM Finovia", "VM-Finovia", "VM Phenovia", "VM-Phenovia"),
 }
 
 VENDOR_MCCS: dict[str, str] = {
@@ -41,6 +44,7 @@ VENDOR_MCCS: dict[str, str] = {
 
 VENDOR_REMITTANCE_PATTERNS: dict[str, re.Pattern[str]] = {
     "vodafone": re.compile(r"Rechnungsnr:\s*(\d{8,14})"),
+    "finovia": re.compile(r"\bReNr\s*:\s*\d{2,}\s*/\s*\d{1,2}\.\d{1,2}\.\d{2,4}", re.I),
 }
 
 # Vodafone invoice numbers are 12 digits starting with 1.
@@ -193,7 +197,7 @@ class MatcherAdapter(Protocol):
     def insert_match(self, match: ProposedMatch) -> int:
         ...
 
-    def update_match_reason_codes(self, match_id: int, reason_codes: list[str]) -> None:
+    def update_match(self, match_id: int, proposal: ProposedMatch) -> None:
         ...
 
 
@@ -236,6 +240,27 @@ def _vendor_reason_codes(tx: Transaction, vendor: str) -> list[str]:
     if tx.mcc:
         codes.append(f"mcc:{tx.mcc}")
     return codes
+
+
+def _normalized_invoice_references(remittance: str) -> set[str]:
+    """Invoice refs as they may appear in receipt text.
+
+    Finovia/DATEV remittance strings use ``ReNr: 1285/30.04.26`` while the
+    invoice candidate uses ``2026/1285``. Return both the raw invoice number
+    and the normalized year/number form so the generic exact-invoice rule can
+    still fire without vendor-specific parser hacks.
+    """
+    out: set[str] = set()
+    for match in re.finditer(
+        r"(?i)\bReNr\s*:\s*(\d{2,})\s*/\s*(\d{1,2})\.(\d{1,2})\.(\d{2,4})",
+        remittance or "",
+    ):
+        number, _day, _month, year = match.groups()
+        if len(year) == 2:
+            year = f"20{year}"
+        out.add(number)
+        out.add(f"{year}/{number}")
+    return out
 
 
 def score_candidate(
@@ -291,8 +316,12 @@ def score_candidate(
     if candidate.direction == "refund" and tx.credit_debit != "C":
         return None
 
-    # Invoice number in tx remittance text directly → very_high.
-    if invoice_no and invoice_no in (tx.remittance_information or ""):
+    # Invoice number in tx remittance text directly → very_high. Also accept
+    # normalized references such as Finovia ``ReNr: 1285/30.04.26`` →
+    # ``2026/1285``.
+    remittance = tx.remittance_information or ""
+    remittance_invoice_refs = _normalized_invoice_references(remittance)
+    if invoice_no and (invoice_no in remittance or invoice_no in remittance_invoice_refs):
         reasons = _vendor_reason_codes(tx, vendor) + [
             f"invoice_no_match:{invoice_no}",
         ]
@@ -490,8 +519,13 @@ def _upsert(adapter: MatcherAdapter, proposal: ProposedMatch, summary: MatcherRu
         summary.inserted += 1
         return
 
-    if set(existing.get("reason_codes") or []) != set(proposal.reason_codes):
-        adapter.update_match_reason_codes(existing["id"], proposal.reason_codes)
+    if (
+        set(existing.get("reason_codes") or []) != set(proposal.reason_codes)
+        or existing.get("decision_status") != proposal.decision_status
+        or existing.get("confidence") != proposal.confidence
+        or existing.get("match_type") != proposal.match_type
+    ):
+        adapter.update_match(existing["id"], proposal)
         summary.updated += 1
     else:
         summary.skipped_existing += 1
@@ -571,10 +605,16 @@ class InMemoryMatcherAdapter:
         )
         return new_id
 
-    def update_match_reason_codes(self, match_id: int, reason_codes: list[str]) -> None:
+    def update_match(self, match_id: int, proposal: ProposedMatch) -> None:
         for m in self.matches:
             if m["id"] == match_id:
-                m["reason_codes"] = list(reason_codes)
+                m["receipt_candidate_id"] = proposal.receipt_candidate_id
+                m["confidence"] = proposal.confidence
+                m["match_type"] = proposal.match_type
+                m["reason_codes"] = list(proposal.reason_codes)
+                m["decision_status"] = proposal.decision_status
+                m["decided_by"] = proposal.decided_by
+                m["legacy_meta"] = proposal.legacy_meta
                 return
 
 
@@ -691,18 +731,37 @@ class PostgresMatcherAdapter:
                     json.dumps(match.legacy_meta) if match.legacy_meta else None,
                 ),
             )
-            return cur.fetchone()["id"]
+            row = cur.fetchone()
+        self.conn.commit()
+        return row["id"]
 
-    def update_match_reason_codes(self, match_id: int, reason_codes: list[str]) -> None:
+    def update_match(self, match_id: int, proposal: ProposedMatch) -> None:
         with self._cursor() as cur:
             cur.execute(
                 """
                 UPDATE bank.receipt_matches
-                   SET reason_codes = %s::jsonb, updated_at = now()
+                   SET receipt_candidate_id = %s,
+                       confidence = %s,
+                       match_type = %s,
+                       reason_codes = %s::jsonb,
+                       decision_status = %s,
+                       decided_by = %s,
+                       legacy_meta = %s::jsonb,
+                       updated_at = now()
                  WHERE id = %s
                 """,
-                (json.dumps(reason_codes), match_id),
+                (
+                    proposal.receipt_candidate_id,
+                    proposal.confidence,
+                    proposal.match_type,
+                    json.dumps(proposal.reason_codes),
+                    proposal.decision_status,
+                    proposal.decided_by,
+                    json.dumps(proposal.legacy_meta) if proposal.legacy_meta else None,
+                    match_id,
+                ),
             )
+        self.conn.commit()
 
 
 __all__ = [

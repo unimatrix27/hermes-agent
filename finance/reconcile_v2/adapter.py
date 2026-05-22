@@ -83,6 +83,16 @@ class Adapter(Protocol):
         limit: int = 100,
     ) -> list[dict[str, Any]]: ...
 
+    def get_receipt_match_with_candidate(
+        self, match_id: int,
+    ) -> Optional[dict[str, Any]]: ...
+
+    def find_latest_receipt_match_for_tx(
+        self, tx_id: int,
+    ) -> Optional[dict[str, Any]]: ...
+
+    def get_belege_sent_by_id(self, belege_sent_id: int) -> Optional[dict[str, Any]]: ...
+
     # writes
     def set_transaction_ignored(
         self, *, tx_id: int, expect_currently: bool,
@@ -120,6 +130,30 @@ class Adapter(Protocol):
         run_id: Optional[int] = None,
     ) -> dict[str, Any]: ...
 
+    def update_receipt_match_status(
+        self,
+        *,
+        match_id: int,
+        decision_status: str,
+        decided_by: str,
+        legacy_belege_sent_id: Optional[int] = None,
+        legacy_meta_patch: Optional[Mapping[str, Any]] = None,
+    ) -> dict[str, Any]: ...
+
+    def create_receipt_match(
+        self,
+        *,
+        bank_tx_id: int,
+        decision_status: str,
+        decided_by: str,
+        match_type: str,
+        reason_codes: Sequence[Any],
+        confidence: Optional[str] = None,
+        receipt_candidate_id: Optional[int] = None,
+        legacy_belege_sent_id: Optional[int] = None,
+        legacy_meta: Optional[Mapping[str, Any]] = None,
+    ) -> dict[str, Any]: ...
+
     def insert_reconcile_run(
         self,
         *,
@@ -127,6 +161,13 @@ class Adapter(Protocol):
         notes: Optional[Mapping[str, Any]],
         invoked_by: str,
     ) -> dict[str, Any]: ...
+
+    def list_reconcile_runs(
+        self,
+        *,
+        month: Optional[str] = None,
+        limit: int = 12,
+    ) -> list[dict[str, Any]]: ...
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -141,10 +182,13 @@ class InMemoryAdapter:
     transactions: list[dict[str, Any]] = field(default_factory=list)
     belege_sent: list[dict[str, Any]] = field(default_factory=list)
     anomalies: list[dict[str, Any]] = field(default_factory=list)
+    receipt_candidates: list[dict[str, Any]] = field(default_factory=list)
+    receipt_matches: list[dict[str, Any]] = field(default_factory=list)
     reconcile_runs: list[dict[str, Any]] = field(default_factory=list)
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     _next_belege_id: int = 1
     _next_anomaly_id: int = 1
+    _next_receipt_match_id: int = 1
     _next_run_id: int = 1
 
     # ── reads ──
@@ -257,6 +301,34 @@ class InMemoryAdapter:
                       reverse=True)
             return [deepcopy(r) for r in rows[:limit]]
 
+    def get_receipt_match_with_candidate(
+        self, match_id: int,
+    ) -> Optional[dict[str, Any]]:
+        with self._lock:
+            match = next((m for m in self.receipt_matches if m.get("id") == match_id), None)
+            if match is None:
+                return None
+            candidate = None
+            cid = match.get("receipt_candidate_id")
+            if cid is not None:
+                candidate = next((c for c in self.receipt_candidates if c.get("id") == cid), None)
+            return {"match": deepcopy(match), "candidate": deepcopy(candidate) if candidate else None}
+
+    def find_latest_receipt_match_for_tx(
+        self, tx_id: int,
+    ) -> Optional[dict[str, Any]]:
+        with self._lock:
+            rows = [m for m in self.receipt_matches if m.get("bank_tx_id") == tx_id]
+            if not rows:
+                return None
+            rows.sort(key=lambda r: (r.get("updated_at") or r.get("created_at") or datetime.min, r.get("id") or 0), reverse=True)
+            return deepcopy(rows[0])
+
+    def get_belege_sent_by_id(self, belege_sent_id: int) -> Optional[dict[str, Any]]:
+        with self._lock:
+            row = next((b for b in self.belege_sent if b.get("id") == belege_sent_id), None)
+            return deepcopy(row) if row else None
+
     # ── writes ──
 
     def set_transaction_ignored(
@@ -357,6 +429,63 @@ class InMemoryAdapter:
             self._next_anomaly_id += 1
             return deepcopy(row)
 
+    def update_receipt_match_status(
+        self,
+        *,
+        match_id: int,
+        decision_status: str,
+        decided_by: str,
+        legacy_belege_sent_id: Optional[int] = None,
+        legacy_meta_patch: Optional[Mapping[str, Any]] = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            for row in self.receipt_matches:
+                if row.get("id") != match_id:
+                    continue
+                row["decision_status"] = decision_status
+                row["decided_by"] = decided_by
+                if legacy_belege_sent_id is not None:
+                    row["legacy_belege_sent_id"] = legacy_belege_sent_id
+                if legacy_meta_patch:
+                    meta = dict(row.get("legacy_meta") or {})
+                    meta.update(dict(legacy_meta_patch))
+                    row["legacy_meta"] = meta
+                row["updated_at"] = datetime.now(timezone.utc)
+                return deepcopy(row)
+            raise NotFound(f"no receipt_match with id {match_id}")
+
+    def create_receipt_match(
+        self,
+        *,
+        bank_tx_id: int,
+        decision_status: str,
+        decided_by: str,
+        match_type: str,
+        reason_codes: Sequence[Any],
+        confidence: Optional[str] = None,
+        receipt_candidate_id: Optional[int] = None,
+        legacy_belege_sent_id: Optional[int] = None,
+        legacy_meta: Optional[Mapping[str, Any]] = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            row = {
+                "id": self._next_receipt_match_id,
+                "receipt_candidate_id": receipt_candidate_id,
+                "bank_tx_id": bank_tx_id,
+                "confidence": confidence,
+                "match_type": match_type,
+                "reason_codes": list(reason_codes),
+                "decision_status": decision_status,
+                "decided_by": decided_by,
+                "legacy_belege_sent_id": legacy_belege_sent_id,
+                "legacy_meta": dict(legacy_meta or {}),
+                "created_at": datetime.now(timezone.utc),
+                "updated_at": datetime.now(timezone.utc),
+            }
+            self.receipt_matches.append(row)
+            self._next_receipt_match_id += 1
+            return deepcopy(row)
+
     def insert_reconcile_run(
         self,
         *,
@@ -378,6 +507,22 @@ class InMemoryAdapter:
             self.reconcile_runs.append(row)
             self._next_run_id += 1
             return deepcopy(row)
+
+    def list_reconcile_runs(
+        self,
+        *,
+        month: Optional[str] = None,
+        limit: int = 12,
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = list(self.reconcile_runs)
+            if month is not None:
+                rows = [r for r in rows if _run_matches_month(r, month)]
+            rows.sort(
+                key=lambda r: r.get("finalized_at") or r.get("started_at") or r.get("created_at") or datetime.min,
+                reverse=True,
+            )
+            return [deepcopy(r) for r in rows[:limit]]
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -525,6 +670,50 @@ class PostgresAdapter:
             )
             return [dict(r) for r in cur.fetchall()]
 
+    def get_receipt_match_with_candidate(
+        self, match_id: int,
+    ) -> Optional[dict[str, Any]]:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    row_to_json(rm.*) AS match,
+                    CASE WHEN rc.id IS NULL THEN NULL ELSE row_to_json(rc.*) END AS candidate
+                  FROM bank.receipt_matches rm
+                  LEFT JOIN bank.receipt_candidates rc
+                    ON rc.id = rm.receipt_candidate_id
+                 WHERE rm.id = %s
+                """,
+                (match_id,),
+            )
+            row = cur.fetchone()
+        if row is None:
+            return None
+        return {"match": dict(row["match"]), "candidate": dict(row["candidate"]) if row["candidate"] else None}
+
+    def find_latest_receipt_match_for_tx(
+        self, tx_id: int,
+    ) -> Optional[dict[str, Any]]:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                SELECT *
+                  FROM bank.receipt_matches
+                 WHERE bank_tx_id = %s
+                 ORDER BY updated_at DESC, id DESC
+                 LIMIT 1
+                """,
+                (tx_id,),
+            )
+            row = cur.fetchone()
+        return dict(row) if row else None
+
+    def get_belege_sent_by_id(self, belege_sent_id: int) -> Optional[dict[str, Any]]:
+        with self._cursor() as cur:
+            cur.execute("SELECT * FROM bank.belege_sent WHERE id = %s", (belege_sent_id,))
+            row = cur.fetchone()
+        return dict(row) if row else None
+
     # ── writes ──
 
     def set_transaction_ignored(
@@ -653,6 +842,81 @@ class PostgresAdapter:
         self.conn.commit()
         return dict(row)
 
+    def update_receipt_match_status(
+        self,
+        *,
+        match_id: int,
+        decision_status: str,
+        decided_by: str,
+        legacy_belege_sent_id: Optional[int] = None,
+        legacy_meta_patch: Optional[Mapping[str, Any]] = None,
+    ) -> dict[str, Any]:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                UPDATE bank.receipt_matches
+                   SET decision_status = %s,
+                       decided_by = %s,
+                       legacy_belege_sent_id = COALESCE(%s, legacy_belege_sent_id),
+                       legacy_meta = COALESCE(legacy_meta, '{}'::jsonb) || %s::jsonb,
+                       updated_at = now()
+                 WHERE id = %s
+             RETURNING *
+                """,
+                (
+                    decision_status,
+                    decided_by,
+                    legacy_belege_sent_id,
+                    json.dumps(dict(legacy_meta_patch or {})),
+                    match_id,
+                ),
+            )
+            row = cur.fetchone()
+        self.conn.commit()
+        if row is None:
+            raise NotFound(f"no receipt_match with id {match_id}")
+        return dict(row)
+
+    def create_receipt_match(
+        self,
+        *,
+        bank_tx_id: int,
+        decision_status: str,
+        decided_by: str,
+        match_type: str,
+        reason_codes: Sequence[Any],
+        confidence: Optional[str] = None,
+        receipt_candidate_id: Optional[int] = None,
+        legacy_belege_sent_id: Optional[int] = None,
+        legacy_meta: Optional[Mapping[str, Any]] = None,
+    ) -> dict[str, Any]:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO bank.receipt_matches (
+                    receipt_candidate_id, bank_tx_id, confidence, match_type,
+                    reason_codes, decision_status, decided_by,
+                    legacy_belege_sent_id, legacy_meta
+                )
+                VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s::jsonb)
+                RETURNING *
+                """,
+                (
+                    receipt_candidate_id,
+                    bank_tx_id,
+                    confidence,
+                    match_type,
+                    json.dumps(list(reason_codes)),
+                    decision_status,
+                    decided_by,
+                    legacy_belege_sent_id,
+                    json.dumps(dict(legacy_meta or {})),
+                ),
+            )
+            row = cur.fetchone()
+        self.conn.commit()
+        return dict(row)
+
     def insert_reconcile_run(
         self,
         *,
@@ -684,6 +948,30 @@ class PostgresAdapter:
         self.conn.commit()
         return dict(row)
 
+    def list_reconcile_runs(
+        self,
+        *,
+        month: Optional[str] = None,
+        limit: int = 12,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if month is not None:
+            clauses.append(
+                "(tool_call_summary->>'month_scope' = %s OR "
+                "tool_call_summary->>'month' = %s OR notes LIKE %s)"
+            )
+            params.extend([month, month, f"%{month}%"])
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        with self._cursor() as cur:
+            cur.execute(
+                f"SELECT * FROM bank.agent_reconcile_runs {where} "
+                "ORDER BY COALESCE(finalized_at, started_at, created_at) DESC "
+                "LIMIT %s",
+                params + [limit],
+            )
+            return [dict(r) for r in cur.fetchall()]
+
 
 # ──────────────────────────────────────────────────────────────────────
 # helpers
@@ -696,3 +984,24 @@ def _month_key(value: Any) -> Optional[str]:
     if isinstance(value, str) and len(value) >= 7:
         return value[:7]
     return None
+
+
+def _run_matches_month(row: Mapping[str, Any], month: str) -> bool:
+    for key in ("tool_call_summary", "notes"):
+        raw = row.get(key)
+        if not raw:
+            continue
+        if isinstance(raw, str):
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                if month in raw:
+                    return True
+                continue
+        elif isinstance(raw, Mapping):
+            payload = raw
+        else:
+            continue
+        if payload.get("month_scope") == month or payload.get("month") == month:
+            return True
+    return False
